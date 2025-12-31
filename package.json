@@ -1,0 +1,46 @@
+{
+  "name": "whisper-wasm-nodejs",
+  "version": "2.0.0",
+  "description": "基于 whisper-web 的 Node.js 语音识别服务器，支持 REST API 和 WebSocket",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test.js",
+    "quick": "node quick_start.js",
+    "demo": "node demo.js",
+    "check-model": "node -e \"console.log('检查模型配置...'); const fs=require('fs'); const path=require('path'); const cacheDir=path.join(__dirname,'node_modules','@xenova','transformers','.cache','Xenova','whisper-tiny'); console.log(fs.existsSync(cacheDir)?'✅ 模型已下载':'❌ 模型未下载'); console.log('位置:', cacheDir);\"",
+    "build": "npm run build:whisper",
+    "build:whisper": "cd whisper-web && npm run build",
+    "install:whisper": "cd whisper-web && npm install"
+  },
+  "keywords": [
+    "whisper",
+    "wasm",
+    "speech-to-text",
+    "audio",
+    "nodejs",
+    "express",
+    "websocket",
+    "rest-api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@xenova/transformers": "^2.7.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "form-data": "^4.0.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.3.2",
+    "wav-decoder": "^1.3.0",
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
