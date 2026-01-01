@@ -10,7 +10,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 // 导入 whisper 功能
-import { audioToText, batchAudioToText, getSupportedModels, getSupportedLanguages, cleanup } from './whisper.js';
+import { audioFromBuffer, batchAudioFromBuffers, getSupportedModels, getSupportedLanguages, cleanup } from './whisper.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,26 +18,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 创建 uploads 目录
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// 配置 multer 用于文件上传
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadsDir);
-    },
-    filename: (req, file, cb) => {
-        // 生成唯一文件名
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
+// 配置 multer 使用内存存储，不保存到磁盘
 const upload = multer({
-    storage: storage,
+    storage: multer.memoryStorage(),
     limits: {
         fileSize: 50 * 1024 * 1024, // 50MB 限制
     },
@@ -70,10 +53,6 @@ app.use(cors({
 app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// 静态文件服务
-app.use('/uploads', express.static(uploadsDir));
-app.use('/api/download', express.static(uploadsDir));
 
 // API 路由
 
@@ -131,7 +110,6 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
             });
         }
 
-        const audioPath = req.file.path;
         const options = {
             model: req.body.model || 'Xenova/whisper-tiny',
             language: req.body.language || 'zh',
@@ -142,13 +120,16 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
         console.log('📁 上传的文件:', req.file.originalname);
         console.log('🎯 使用模型:', options.model);
         console.log('🌍 语言设置:', options.language);
+        console.log('💾 文件大小:', (req.file.size / 1024 / 1024).toFixed(2), 'MB');
 
         // 记录开始时间
         const startTime = Date.now();
 
-        // 执行转录
-        const result = await audioToText(audioPath, {
+        // 直接从内存缓冲区处理音频数据
+        const result = await audioFromBuffer(req.file.buffer, {
             ...options,
+            filename: req.file.originalname,
+            mimetype: req.file.mimetype,
             progress_callback: (data) => {
                 if (data.status === 'initiate') {
                     console.log(`📥 正在下载: ${data.file}`);
@@ -172,8 +153,7 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
                 fileInfo: {
                     originalName: req.file.originalname,
                     size: req.file.size,
-                    mimetype: req.file.mimetype,
-                    path: req.file.path
+                    mimetype: req.file.mimetype
                 }
             }
         };
@@ -185,11 +165,6 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
 
     } catch (error) {
         console.error('❌ 转录错误:', error);
-        
-        // 清理上传的文件
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
 
         res.status(500).json({
             success: false,
@@ -211,7 +186,6 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
             });
         }
 
-        const audioPaths = req.files.map(file => file.path);
         const options = {
             model: req.body.model || 'Xenova/whisper-tiny',
             language: req.body.language || 'zh',
@@ -225,8 +199,19 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
         // 记录开始时间
         const startTime = Date.now();
 
-        // 执行批量转录
-        const results = await batchAudioToText(audioPaths, options);
+        // 直接从内存缓冲区批量处理音频数据
+        // 将文件缓冲区与选项提取出来以匹配 batchAudioFromBuffers 的参数格式
+        const audioBuffers = req.files.map(file => file.buffer);
+        const fileOptions = req.files.map(file => ({
+            filename: file.originalname,
+            mimetype: file.mimetype,
+            language: options.language,
+            subtask: options.subtask,
+            quantized: options.quantized,
+            progress_callback: options.progress_callback
+        }));
+        
+        const results = await batchAudioFromBuffers(audioBuffers, fileOptions);
 
         // 计算处理时间
         const processingTime = Date.now() - startTime;
@@ -245,8 +230,7 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
                 fileInfo: req.files.map(file => ({
                     originalName: file.originalname,
                     size: file.size,
-                    mimetype: file.mimetype,
-                    path: file.path
+                    mimetype: file.mimetype
                 }))
             }
         };
@@ -258,15 +242,6 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
 
     } catch (error) {
         console.error('❌ 批量转录错误:', error);
-        
-        // 清理上传的文件
-        if (req.files) {
-            req.files.forEach(file => {
-                if (fs.existsSync(file.path)) {
-                    fs.unlinkSync(file.path);
-                }
-            });
-        }
 
         res.status(500).json({
             success: false,

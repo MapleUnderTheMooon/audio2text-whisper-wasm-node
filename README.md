@@ -243,11 +243,7 @@ whisper-wasm-nodejs/
 ├── quick_start.js               # 快速开始脚本
 ├── examples.js                  # 使用示例代码
 ├── download_model.js            # 模型下载工具
-├── hhhh.wav                     # 测试音频文件
 ├── README.md                    # 项目文档
-├── config/                      # 配置文件目录
-│   └── traditional-to-simplified.json
-├── uploads/                     # 用户上传文件目录
 └── node_modules/                # 依赖包目录
     └── @xenova/
         └── transformers/        # Whisper 模型缓存

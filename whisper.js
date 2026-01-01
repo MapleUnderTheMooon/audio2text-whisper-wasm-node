@@ -3,16 +3,62 @@ import path from 'path';
 import { pipeline, env } from '@xenova/transformers';
 import { fileURLToPath } from 'url';
 import WavDecoder from 'wav-decoder';
+import { sify } from 'chinese-conv';
 
 // 解决 __dirname 问题
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 音频文件解码函数
+// 使用 chinese-conv 库进行简繁体转换
+// 繁体转简体
+function traditionalToSimplified(text) {
+    if (!text) return text;
+    
+    try {
+        // 使用 chinese-conv 库的 sify 函数进行转换
+        // sify = Simplify (traditional to simplified)
+        return sify(text);
+    } catch (error) {
+        console.error('❌ 简繁体转换失败:', error.message);
+        // 如果转换失败，返回原始文本
+        return text;
+    }
+}
+
+// 音频文件解码函数（从文件路径）
 async function decodeAudioFile(audioPath) {
     try {
         const ext = path.extname(audioPath).toLowerCase();
         const buffer = fs.readFileSync(audioPath);
+        
+        return await decodeAudioBuffer(buffer, ext);
+    } catch (error) {
+        console.error('❌ 音频解码失败:', error.message);
+        throw new Error(`音频解码失败: ${error.message}`);
+    }
+}
+
+// 从内存缓冲区解码音频数据
+async function decodeAudioBuffer(buffer, ext = null, mimetype = null) {
+    try {
+        // 如果没有提供扩展名，尝试从 mimetype 推断
+        if (!ext && mimetype) {
+            if (mimetype.includes('wav')) {
+                ext = '.wav';
+            } else if (mimetype.includes('mp3')) {
+                ext = '.mp3';
+            } else if (mimetype.includes('mp4') || mimetype.includes('mpeg4')) {
+                ext = '.mp4';
+            } else if (mimetype.includes('m4a')) {
+                ext = '.m4a';
+            } else if (mimetype.includes('flac')) {
+                ext = '.flac';
+            } else if (mimetype.includes('ogg')) {
+                ext = '.ogg';
+            } else if (mimetype.includes('webm')) {
+                ext = '.webm';
+            }
+        }
         
         if (ext === '.wav') {
             try {
@@ -40,12 +86,12 @@ async function decodeAudioFile(audioPath) {
             }
         } else {
             // 对于其他格式，暂时返回Buffer
-            console.log(`⚠️  格式 ${ext} 可能需要额外处理，目前返回Buffer`);
+            console.log(`⚠️  格式 ${ext || '未知'} 可能需要额外处理，目前返回Buffer`);
             return buffer;
         }
     } catch (error) {
-        console.error('❌ 音频解码失败:', error.message);
-        throw new Error(`音频解码失败: ${error.message}`);
+        console.error('❌ 音频缓冲解码失败:', error.message);
+        throw new Error(`音频缓冲解码失败: ${error.message}`);
     }
 }
 
@@ -395,6 +441,149 @@ export async function audioToText(audioPath, options = {}) {
     }
 }
 
+// 从内存缓冲区处理音频数据
+export async function audioFromBuffer(audioBuffer, options = {}) {
+    try {
+        // 检查传入的数据
+        if (!audioBuffer) {
+            throw new Error('没有提供音频数据');
+        }
+        
+        console.log('🚀 开始处理内存中的音频数据');
+        console.log(`📁 数据大小: ${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+        
+        // 获取文件信息（如果有）
+        const filename = options.filename || '内存中的音频';
+        const mimetype = options.mimetype || 'application/octet-stream';
+        const ext = options.ext || path.extname(filename).toLowerCase();
+        
+        console.log(`📄 原始文件名: ${filename}`);
+        console.log(`🎭 MIME类型: ${mimetype}`);
+        
+        // 设置默认选项
+        const defaultOptions = {
+            model: 'Xenova/whisper-tiny',
+            quantized: false,
+            multilingual: true,
+            subtask: 'transcribe',
+            language: 'zh', // 中文
+            progress_callback: (data) => {
+                if (data.status === 'initiate') {
+                    console.log(`📥 正在下载: ${data.file}`);
+                } else if (data.status === 'progress') {
+                    console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
+                } else if (data.status === 'done') {
+                    console.log(`✅ 下载完成: ${data.file}`);
+                }
+            }
+        };
+        
+        const config = { ...defaultOptions, ...options };
+        
+        // 检查是否是 Distil Whisper 模型
+        const isDistilWhisper = config.model.startsWith('distil-whisper/');
+        
+        let modelName = config.model;
+        if (!isDistilWhisper && !config.multilingual) {
+            modelName += '.en';
+        }
+        
+        // 管理模型实例
+        const factory = WhisperPipelineFactory;
+        if (factory.model !== modelName || factory.quantized !== config.quantized) {
+            // 如果模型不同，释放之前的实例
+            if (factory.instance !== null) {
+                await factory.dispose();
+            }
+            factory.model = modelName;
+            factory.quantized = config.quantized;
+        }
+        
+        console.log('🎯 正在加载语音识别模型:', modelName);
+        console.log('📊 配置:', {
+            quantized: config.quantized,
+            multilingual: config.multilingual,
+            language: config.language,
+            subtask: config.subtask
+        });
+        
+        // 加载转录模型
+        const transcriber = await factory.getInstance(config.progress_callback);
+        
+        // 解码音频缓冲区
+        console.log('🔧 正在解码音频数据...');
+        const audioData = await decodeAudioBuffer(audioBuffer, ext, mimetype);
+        
+        // 计算时间精度
+        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length / 
+                             transcriber.model.config.max_source_positions;
+        
+        console.log('🎤 正在进行语音识别...');
+        console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
+        console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
+        
+        // 执行转录 - 传递Float32Array数据
+        const output = await transcriber(audioData, {
+            // Greedy 搜索
+            top_k: 0,
+            do_sample: false,
+            
+            // 滑动窗口
+            chunk_length_s: isDistilWhisper ? 20 : 30,
+            stride_length_s: isDistilWhisper ? 3 : 5,
+            
+            // 语言和任务
+            language: config.language,
+            task: config.subtask,
+            
+            // 返回时间戳
+            return_timestamps: true,
+            force_full_sequences: false,
+            
+            // 进度回调
+            callback_function: (item) => {
+                const lastChunk = item[0];
+                if (lastChunk && lastChunk.output_token_ids) {
+                    console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
+                }
+            }
+        });
+        
+        console.log('✅ 语音识别完成！');
+        
+        // 格式化结果
+        const result = {
+            text: traditionalToSimplified(output.text),
+            chunks: output.chunks || [],
+            language: output.language || config.language,
+            duration: output.duration || 0,
+            task: config.subtask,
+            model: modelName,
+            timestamp: new Date().toISOString(),
+            confidence: calculateConfidence(output.chunks || [])
+        };
+        
+        // 如果检测到繁体字，转换为简体并记录
+        if (output.text !== result.text) {
+            console.log('🔄 检测到繁体字，已转换为简体中文');
+        }
+        
+        return result;
+        
+    } catch (error) {
+        console.error('❌ 音频缓冲区处理出错:', error.message);
+        
+        // 尝试释放模型实例
+        try {
+            await WhisperPipelineFactory.dispose();
+        } catch (disposeError) {
+            console.error('⚠️  释放模型实例时出错:', disposeError.message);
+        }
+        
+        throw error;
+    }
+}
+
 // 批量处理音频文件
 export async function batchAudioToText(audioPaths, options = {}) {
     const results = [];
@@ -430,60 +619,61 @@ export async function batchAudioToText(audioPaths, options = {}) {
     return results;
 }
 
-// 加载简繁体转换配置
-import { promises as fs } from 'fs';
-import path from 'path';
-
-let TRADITIONAL_TO_SIMPLIFIED_MAPPING = {};
-let mappingLoaded = false;
-
-// 同步加载简繁体映射表
-function loadTraditionalMappingSync() {
-    try {
-        const configPath = path.join(process.cwd(), 'config', 'traditional-to-simplified.json');
-        const configData = fs.readFileSync(configPath, 'utf8');
-        const config = JSON.parse(configData);
-        TRADITIONAL_TO_SIMPLIFIED_MAPPING = config.mappings || {};
-        mappingLoaded = true;
-        console.log('✅ 简繁体转换配置加载成功');
-    } catch (error) {
-        console.warn('⚠️  简繁体转换配置文件加载失败，使用默认映射:', error.message);
-        // 默认映射表
-        TRADITIONAL_TO_SIMPLIFIED_MAPPING = {
-            '準備': '准备',
-            '說': '说',
-            '認': '认',
-            '為': '为',
-            '與': '与',
-            '這': '这',
-            '時': '时',
-            '間': '间',
-            '會': '会',
-            '國': '国'
-        };
-        mappingLoaded = true;
+// 批量处理内存中的音频缓冲区
+export async function batchAudioFromBuffers(audioBuffers, options = []) {
+    if (!Array.isArray(audioBuffers)) {
+        throw new Error('需要提供音频缓冲区数组');
     }
+    
+    // 如果没有提供单独的选项数组，则对所有音频应用相同的选项
+    if (!Array.isArray(options) || options.length === 0) {
+        options = Array(audioBuffers.length).fill({});
+    }
+    
+    // 确保选项数组长度与音频缓冲区数组匹配
+    if (options.length !== audioBuffers.length) {
+        throw new Error(`选项数组长度(${options.length})与音频缓冲区数组长度(${audioBuffers.length})不匹配`);
+    }
+    
+    const results = [];
+    
+    console.log(`📂 开始批量处理 ${audioBuffers.length} 个音频缓冲区...\n`);
+    
+    for (let i = 0; i < audioBuffers.length; i++) {
+        const audioBuffer = audioBuffers[i];
+        const bufferOptions = options[i];
+        const filename = bufferOptions.filename || `内存中的音频${i+1}`;
+        
+        console.log(`--- 处理缓冲区 ${i + 1}/${audioBuffers.length}: ${filename} ---`);
+        
+        try {
+            const result = await audioFromBuffer(audioBuffer, bufferOptions);
+            results.push({
+                index: i,
+                filename: filename,
+                success: true,
+                text: result.text,
+                duration: result.duration,
+                confidence: result.confidence,
+                language: result.language,
+                timestamp: result.timestamp
+            });
+            console.log(`✅ 缓冲区 ${i + 1} 处理成功\n`);
+        } catch (error) {
+            results.push({
+                index: i,
+                filename: filename,
+                success: false,
+                error: error.message
+            });
+            console.log(`❌ 缓冲区 ${i + 1} 处理失败: ${error.message}\n`);
+        }
+    }
+    
+    return results;
 }
 
-// 模块加载时立即初始化映射表
-loadTraditionalMappingSync();
 
-// 繁体转简体
-function traditionalToSimplified(text) {
-    if (!text) return text;
-    
-    // 确保映射表已加载
-    if (!mappingLoaded) {
-        loadTraditionalMappingSync();
-    }
-    
-    let simplified = text;
-    for (const [traditional, simplifiedChar] of Object.entries(TRADITIONAL_TO_SIMPLIFIED_MAPPING)) {
-        simplified = simplified.replace(new RegExp(traditional, 'g'), simplifiedChar);
-    }
-    
-    return simplified;
-}
 
 // 计算置信度
 function calculateConfidence(chunks) {
