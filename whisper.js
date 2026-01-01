@@ -564,10 +564,18 @@ export async function audioToText(audioPath, options = {}) {
         
         const config = { ...defaultOptions, ...options };
         
-        // 检查是否是 Distil Whisper 模型
-        const isDistilWhisper = config.model.startsWith('distil-whisper/');
-        
+        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
         let modelName = config.model;
+        
+        // 如果是简写模型名称，添加完整前缀
+        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
+        if (modelShortNames.includes(modelName)) {
+            modelName = `Xenova/whisper-${modelName}`;
+        }
+        
+        // 检查是否是 Distil Whisper 模型
+        const isDistilWhisper = modelName.startsWith('distil-whisper/');
+        
         if (!isDistilWhisper && !config.multilingual) {
             modelName += '.en';
         }
@@ -763,10 +771,18 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         
         const config = { ...defaultOptions, ...options };
         
-        // 检查是否是 Distil Whisper 模型
-        const isDistilWhisper = config.model.startsWith('distil-whisper/');
-        
+        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
         let modelName = config.model;
+        
+        // 如果是简写模型名称，添加完整前缀
+        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
+        if (modelShortNames.includes(modelName)) {
+            modelName = `Xenova/whisper-${modelName}`;
+        }
+        
+        // 检查是否是 Distil Whisper 模型
+        const isDistilWhisper = modelName.startsWith('distil-whisper/');
+        
         if (!isDistilWhisper && !config.multilingual) {
             modelName += '.en';
         }

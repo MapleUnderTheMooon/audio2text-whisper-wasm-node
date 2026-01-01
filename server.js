@@ -110,10 +110,20 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
             });
         }
 
+        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
+        let modelName = req.body.model || 'Xenova/whisper-tiny';
+        
+        // 如果是简写模型名称，添加完整前缀
+        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
+        if (modelShortNames.includes(modelName)) {
+            modelName = `Xenova/whisper-${modelName}`;
+        }
+        
         const options = {
-            model: req.body.model || 'Xenova/whisper-tiny',
+            model: modelName,
             language: req.body.language || 'zh',
-            quantized: req.body.quantized === 'true',
+            // 支持布尔值和字符串形式的 quantized 参数
+            quantized: req.body.quantized === true || req.body.quantized === 'true',
             subtask: req.body.subtask || 'transcribe'
         };
 
@@ -186,10 +196,20 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
             });
         }
 
+        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
+        let modelName = req.body.model || 'Xenova/whisper-tiny';
+        
+        // 如果是简写模型名称，添加完整前缀
+        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
+        if (modelShortNames.includes(modelName)) {
+            modelName = `Xenova/whisper-${modelName}`;
+        }
+        
         const options = {
-            model: req.body.model || 'Xenova/whisper-tiny',
+            model: modelName,
             language: req.body.language || 'zh',
-            quantized: req.body.quantized === 'true',
+            // 支持布尔值和字符串形式的 quantized 参数
+            quantized: req.body.quantized === true || req.body.quantized === 'true',
             subtask: req.body.subtask || 'transcribe'
         };
 

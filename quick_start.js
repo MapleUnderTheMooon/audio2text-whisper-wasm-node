@@ -85,11 +85,35 @@ async function runQuickTest() {
             
             const startTime = Date.now();
             
-            // 执行语音识别
-            const result = await audioToText(audioFile, {
-                language: 'zh',
-                model: 'Xenova/whisper-tiny'
-            });
+            // 测试不同模型加载
+            const testModels = [
+                'Xenova/whisper-tiny',
+                'base', // 测试简写模型名称
+                'Xenova/whisper-base' // 测试完整模型名称
+            ];
+            
+            for (const modelName of testModels) {
+                console.log(`\n🔄 测试模型: ${modelName}`);
+                const startTime = Date.now();
+                
+                try {
+                    // 执行语音识别
+                    const result = await audioToText(audioFile, {
+                        language: 'zh',
+                        model: modelName
+                    });
+                    
+                    const endTime = Date.now();
+                    const processingTime = (endTime - startTime) / 1000;
+                    
+                    console.log(`✅ 模型 ${modelName} 加载成功！`);
+                    console.log(`   📝 识别结果: ${result.text.substring(0, 50)}${result.text.length > 50 ? '...' : ''}`);
+                    console.log(`   ⏱️  处理时间: ${processingTime.toFixed(2)}秒`);
+                    console.log(`   🤖 使用模型: ${result.model}`);
+                } catch (modelError) {
+                    console.error(`❌ 模型 ${modelName} 加载失败:`, modelError.message);
+                }
+            }
             
             const endTime = Date.now();
             const processingTime = (endTime - startTime) / 1000;
