@@ -4,6 +4,12 @@ import { pipeline, env } from '@xenova/transformers';
 import { fileURLToPath } from 'url';
 import WavDecoder from 'wav-decoder';
 import { sify } from 'chinese-conv';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
+
+const execAsync = promisify(exec);
 
 // 解决 __dirname 问题
 const __filename = fileURLToPath(import.meta.url);
@@ -84,9 +90,34 @@ async function decodeAudioBuffer(buffer, ext = null, mimetype = null) {
                 console.log(`⚠️  WavDecoder失败，尝试手动解析: ${decodeError.message}`);
                 return manualWavParse(buffer);
             }
+        } else if (ext === '.webm' || mimetype.includes('webm')) {
+            // 处理 WebM/Opus 格式
+            console.log(`📊 WebM文件信息: 大小=${(buffer.length / 1024).toFixed(2)}KB, MIME类型=${mimetype}`);
+            console.log(`🔄 开始解码 WebM/Opus 格式...`);
+            
+            try {
+                // 使用 FFmpeg 解码 WebM 文件
+                const audioData = await decodeWebMWithFFmpeg(buffer);
+                console.log(`✅ WebM 解码成功，采样率=16000Hz, 时长=${(audioData.length/16000).toFixed(2)}s`);
+                return audioData;
+            } catch (ffmpegError) {
+                console.error(`⚠️  FFmpeg 解码失败: ${ffmpegError.message}`);
+                console.log(`🔄 尝试使用 opus-decoder 解码...`);
+                
+                try {
+                    // 尝试使用 opus-decoder 作为备选方案
+                    const audioData = await decodeWebMWithOpusDecoder(buffer);
+                    console.log(`✅ Opus 解码成功，采样率=16000Hz, 时长=${(audioData.length/16000).toFixed(2)}s`);
+                    return audioData;
+                } catch (opusError) {
+                    console.error(`❌ Opus 解码也失败: ${opusError.message}`);
+                    throw new Error(`WebM 解码失败: ${ffmpegError.message}, ${opusError.message}`);
+                }
+            }
         } else {
-            // 对于其他格式，暂时返回Buffer
-            console.log(`⚠️  格式 ${ext || '未知'} 可能需要额外处理，目前返回Buffer`);
+            // 对于其他格式，直接返回Buffer
+            console.log(`📊 ${ext || '未知'}格式文件信息: 大小=${(buffer.length / 1024).toFixed(2)}KB, MIME类型=${mimetype}`);
+            console.log(`🎯 格式已识别，直接传递给Whisper处理`);
             return buffer;
         }
     } catch (error) {
@@ -136,6 +167,182 @@ function resampleAudio(audioData, originalRate, targetRate) {
     }
     
     return resampled;
+}
+
+// 使用 FFmpeg 解码 WebM 文件
+async function decodeWebMWithFFmpeg(buffer) {
+    let inputPath = null;
+    let outputPath = null;
+    let inputFileHandle = null;
+    let outputFileHandle = null;
+    
+    try {
+        // 检查是否有 ffmpeg 可用
+        let ffmpegPath = 'ffmpeg';
+        try {
+            await execAsync('ffmpeg -version');
+        } catch (e) {
+            // 尝试使用 ffmpeg-static
+            try {
+                const ffmpegStatic = await import('ffmpeg-static');
+                if (ffmpegStatic.default) {
+                    ffmpegPath = ffmpegStatic.default;
+                    console.log('📦 使用 ffmpeg-static');
+                }
+            } catch (staticError) {
+                throw new Error('未找到 FFmpeg，请安装 ffmpeg 或 ffmpeg-static');
+            }
+        }
+        
+        // 获取 FFmpeg 的完整路径（避免短路径）
+        try {
+            if (fs.existsSync(ffmpegPath)) {
+                ffmpegPath = fs.realpathSync(ffmpegPath);
+            }
+        } catch (realpathError) {
+            console.warn('⚠️  无法获取 FFmpeg 完整路径，使用原始路径');
+        }
+        
+        // 创建临时文件
+        const tempDir = tmpdir();
+        const uuid = randomUUID();
+        inputPath = path.join(tempDir, `input_${uuid}.webm`);
+        outputPath = path.join(tempDir, `output_${uuid}.wav`);
+        
+        // 使用 resolve 获取完整路径（避免短路径格式）
+        inputPath = path.resolve(inputPath);
+        outputPath = path.resolve(outputPath);
+        
+        // 写入输入文件并同步到磁盘
+        console.log(`📝 写入临时文件: ${inputPath}`);
+        inputFileHandle = fs.openSync(inputPath, 'w');
+        fs.writeSync(inputFileHandle, buffer);
+        fs.fsyncSync(inputFileHandle); // 确保数据写入磁盘
+        fs.closeSync(inputFileHandle);
+        inputFileHandle = null;
+        
+        // 验证文件已写入
+        if (!fs.existsSync(inputPath)) {
+            throw new Error('临时输入文件创建失败');
+        }
+        
+        // 使用 FFmpeg 转换为 WAV 格式（16kHz, 单声道, PCM）
+        // 在 Windows 上，路径需要特殊处理
+        const isWindows = process.platform === 'win32';
+        
+        // 转义路径中的特殊字符，使用双引号包裹
+        const escapePath = (filePath) => {
+            // 在 Windows 上，路径中的反斜杠需要转义
+            if (isWindows) {
+                // 将反斜杠转换为正斜杠，或者保持反斜杠但正确转义
+                return filePath.replace(/\\/g, '/');
+            }
+            return filePath;
+        };
+        
+        const inputPathEscaped = escapePath(inputPath);
+        const outputPathEscaped = escapePath(outputPath);
+        const ffmpegPathEscaped = escapePath(ffmpegPath);
+        
+        // 构建命令，使用双引号包裹所有路径
+        const command = `"${ffmpegPathEscaped}" -i "${inputPathEscaped}" -ar 16000 -ac 1 -f wav -acodec pcm_s16le -y "${outputPathEscaped}"`;
+        
+        console.log('🔄 正在使用 FFmpeg 转换 WebM 文件...');
+        console.log(`📋 FFmpeg 路径: ${ffmpegPathEscaped}`);
+        console.log(`📋 输入文件: ${inputPathEscaped}`);
+        console.log(`📋 输出文件: ${outputPathEscaped}`);
+        
+        try {
+            const { stdout, stderr } = await execAsync(command, {
+                maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+                encoding: 'utf8'
+            });
+            
+            if (stderr && !stderr.includes('Stream mapping') && !stderr.includes('Output')) {
+                console.warn('⚠️  FFmpeg 警告:', stderr.substring(0, 200));
+            }
+        } catch (execError) {
+            // 提供更详细的错误信息
+            const errorMsg = execError.message || execError.toString();
+            const errorDetails = execError.stderr || execError.stdout || '';
+            console.error('❌ FFmpeg 执行失败:');
+            console.error('   命令:', command);
+            console.error('   错误:', errorMsg);
+            if (errorDetails) {
+                console.error('   详情:', errorDetails.substring(0, 500));
+            }
+            throw new Error(`FFmpeg 转换失败: ${errorMsg}`);
+        }
+        
+        // 等待输出文件生成
+        let retries = 10;
+        while (!fs.existsSync(outputPath) && retries > 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            retries--;
+        }
+        
+        if (!fs.existsSync(outputPath)) {
+            throw new Error('FFmpeg 输出文件未生成');
+        }
+        
+        // 读取转换后的 WAV 文件
+        const wavBuffer = fs.readFileSync(outputPath);
+        
+        if (wavBuffer.length === 0) {
+            throw new Error('FFmpeg 输出文件为空');
+        }
+        
+        // 使用 WavDecoder 解码 WAV 数据
+        const decoded = await WavDecoder.decode(wavBuffer);
+        
+        // 转换为 Float32Array（单声道）
+        let audioData = decoded.channelData.length > 1 
+            ? mergeChannels(decoded.channelData)
+            : decoded.channelData[0];
+        
+        // 确保采样率为 16kHz
+        if (decoded.sampleRate !== 16000) {
+            console.log(`🔄 重采样: ${decoded.sampleRate}Hz → 16000Hz`);
+            audioData = resampleAudio(audioData, decoded.sampleRate, 16000);
+        }
+        
+        return audioData;
+        
+    } catch (error) {
+        console.error('❌ FFmpeg 解码 WebM 失败:', error.message);
+        if (error.stack) {
+            console.error('   堆栈:', error.stack.split('\n').slice(0, 5).join('\n'));
+        }
+        throw error;
+    } finally {
+        // 清理临时文件
+        try {
+            if (inputFileHandle) {
+                try {
+                    fs.closeSync(inputFileHandle);
+                } catch (e) {
+                    // 忽略关闭错误
+                }
+            }
+            if (inputPath && fs.existsSync(inputPath)) {
+                fs.unlinkSync(inputPath);
+            }
+            if (outputPath && fs.existsSync(outputPath)) {
+                fs.unlinkSync(outputPath);
+            }
+        } catch (cleanupError) {
+            console.warn('⚠️  清理临时文件失败:', cleanupError.message);
+        }
+    }
+}
+
+// 使用 opus-decoder 解码 WebM 文件（备选方案）
+// 注意：这个实现需要先解析 WebM 容器，目前作为备选方案
+async function decodeWebMWithOpusDecoder(buffer) {
+    // WebM 容器格式需要先解析才能提取 Opus 数据
+    // 这个实现目前不支持直接解码 WebM 容器
+    // 建议使用 FFmpeg 进行解码
+    throw new Error('Opus 解码器需要先解析 WebM 容器，请使用 FFmpeg 进行解码');
 }
 
 // 手动WAV文件解析（备选方案）
@@ -399,8 +606,11 @@ export async function audioToText(audioPath, options = {}) {
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
         
-        // 执行转录 - 传递Float32Array数据
-        const output = await transcriber(audioData, {
+                // 执行转录 - 确保传入正确的音频格式
+        let output;
+        
+        // 构建转录配置
+        const transcribeConfig = {
             // Greedy 搜索
             top_k: 0,
             do_sample: false,
@@ -424,9 +634,55 @@ export async function audioToText(audioPath, options = {}) {
                     console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
                 }
             }
-        });
+        };
+        
+        try {
+            if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
+                // 如果已经是 Float32Array 或 Float64Array，直接传递
+                console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
+                output = await transcriber(audioData, transcribeConfig);
+            } else if (audioData instanceof Buffer) {
+                // 如果是 Buffer，将其转换为 ArrayBuffer 后直接传递
+                console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
+                const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
+                output = await transcriber(arrayBuffer, transcribeConfig);
+            } else if (audioData instanceof ArrayBuffer) {
+                // 如果是 ArrayBuffer，直接传递
+                console.log('🎯 音频数据为 ArrayBuffer，直接传递');
+                output = await transcriber(audioData, transcribeConfig);
+            } else {
+                // 其他情况，直接传递
+                console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
+                output = await transcriber(audioData, transcribeConfig);
+            }
+        } catch (transcribeError) {
+            console.error('❌ 转录过程出错:', transcribeError.message);
+            console.error('❌ 转录错误堆栈:', transcribeError.stack);
+            throw transcribeError;
+        }
         
         console.log('✅ 语音识别完成！');
+        
+        // 调试：查看 output 对象结构
+        console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
+            if (typeof value === 'object' && value !== null) {
+                const limited = {};
+                for (const k of Object.keys(value).slice(0, 10)) {
+                    limited[k] = value[k];
+                }
+                if (Object.keys(value).length > 10) {
+                    limited['...'] = `${Object.keys(value).length - 10} more keys`;
+                }
+                return limited;
+            }
+            return value;
+        }, 2));
+        
+        // 调试：查看 output.text
+        console.log('🔍 调试：output.text:', typeof output.text, output.text);
+        
+        // 调试：查看 output.text 长度
+        console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
         
         // 格式化结果
         const result = {
@@ -439,6 +695,10 @@ export async function audioToText(audioPath, options = {}) {
             timestamp: new Date().toISOString(),
             confidence: calculateConfidence(output.chunks || [])
         };
+        
+        // 调试：查看 result.text
+        console.log('🔍 调试：result.text:', typeof result.text, result.text);
+        console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
         
         // 如果检测到繁体字，转换为简体并记录
         if (output.text !== result.text) {
@@ -545,8 +805,9 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
         
-        // 执行转录 - 传递Float32Array数据
-        const output = await transcriber(audioData, {
+        // 执行转录 - 确保传入正确的音频格式
+        let output;
+        const transcribeConfig = {
             // Greedy 搜索
             top_k: 0,
             do_sample: false,
@@ -561,18 +822,55 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
             
             // 返回时间戳
             return_timestamps: true,
-            force_full_sequences: false,
-            
-            // 进度回调
-            callback_function: (item) => {
-                const lastChunk = item[0];
-                if (lastChunk && lastChunk.output_token_ids) {
-                    console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
-                }
+        };
+        
+        try {
+            if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
+                // 如果已经是 Float32Array 或 Float64Array，直接传递
+                console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
+                output = await transcriber(audioData, transcribeConfig);
+            } else if (audioData instanceof Buffer) {
+                // 如果是 Buffer，转换为 ArrayBuffer 后直接传递
+                console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
+                const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
+                output = await transcriber(arrayBuffer, transcribeConfig);
+            } else if (audioData instanceof ArrayBuffer) {
+                // 如果是 ArrayBuffer，直接传递
+                console.log('🎯 音频数据为 ArrayBuffer，直接传递');
+                output = await transcriber(audioData, transcribeConfig);
+            } else {
+                // 其他情况，直接传递
+                console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
+                output = await transcriber(audioData, transcribeConfig);
             }
-        });
+        } catch (transcribeError) {
+            console.error('❌ 转录过程出错:', transcribeError.message);
+            console.error('❌ 转录错误堆栈:', transcribeError.stack);
+            throw transcribeError;
+        }
         
         console.log('✅ 语音识别完成！');
+        
+        // 调试：查看 output 对象结构
+        console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
+            if (typeof value === 'object' && value !== null) {
+                const limited = {};
+                for (const k of Object.keys(value).slice(0, 10)) {
+                    limited[k] = value[k];
+                }
+                if (Object.keys(value).length > 10) {
+                    limited['...'] = `${Object.keys(value).length - 10} more keys`;
+                }
+                return limited;
+            }
+            return value;
+        }, 2));
+        
+        // 调试：查看 output.text
+        console.log('🔍 调试：output.text:', typeof output.text, output.text);
+        
+        // 调试：查看 output.text 长度
+        console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
         
         // 格式化结果
         const result = {
@@ -585,6 +883,10 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
             timestamp: new Date().toISOString(),
             confidence: calculateConfidence(output.chunks || [])
         };
+        
+        // 调试：查看 result.text
+        console.log('🔍 调试：result.text:', typeof result.text, result.text);
+        console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
         
         // 如果检测到繁体字，转换为简体并记录
         if (output.text !== result.text) {
