@@ -141,6 +141,9 @@ dist/
 *.swo
 *~
 
+# Trae IDE configuration files
+.trae/
+
 # Package manager lockfiles (optional, uncomment if you don't want to commit them)
 # package-lock.json
 # yarn.lock

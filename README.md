@@ -22,7 +22,19 @@
 npm install
 ```
 
-### 2. 启动服务器
+### 2. 下载模型
+
+在启动服务器之前，需要先下载Whisper模型：
+
+```bash
+# 下载默认模型（whisper-tiny）
+node download_model.js
+
+# 检查模型状态
+npm run check-model
+```
+
+### 3. 启动服务器
 
 ```bash
 # 启动开发服务器
@@ -34,8 +46,8 @@ npm start
 # 快速演示
 npm run quick
 
-# 检查模型状态
-npm run check-model
+# 多进程模式启动（推荐，充分利用多核CPU）
+npm run start:cluster
 ```
 
 ### 3. 访问服务

@@ -219,6 +219,13 @@ function manualWavParse(buffer) {
 // 启用本地模型，支持从本地文件系统加载
 env.allowLocalModels = true;
 
+// WASM 性能优化配置
+env.simd = true; // 启用 SIMD 支持，提升 WASM 执行速度
+console.log('⚡ 已启用 WASM SIMD 支持');
+
+env.wasmMemoryLimit = 1024; // 设置 WASM 内存限制为 1024 MB
+console.log('📊 WASM 内存限制设置为:', env.wasmMemoryLimit + 'MB');
+
 // 设置模型目录优先级：先查找项目models目录，再查找默认缓存
 const defaultCacheDir = path.join(__dirname, 'node_modules', '@xenova', 'transformers', '.cache', 'Xenova', 'whisper-tiny');
 const projectModelsDir = path.join(__dirname, 'models');
@@ -289,8 +296,21 @@ class WhisperPipelineFactory {
 
     static async dispose() {
         if (this.instance !== null) {
-            await this.instance.dispose();
-            this.instance = null;
+            try {
+                await this.instance.dispose();
+                console.log('🗑️  模型实例已释放');
+            } catch (error) {
+                console.error('❌ 释放模型实例失败:', error.message);
+            } finally {
+                this.instance = null;
+                this.model = null;
+                this.quantized = null;
+                // 触发垃圾回收
+                if (global.gc) {
+                    global.gc();
+                    console.log('🧹 已触发垃圾回收');
+                }
+            }
         }
     }
 }
@@ -424,6 +444,9 @@ export async function audioToText(audioPath, options = {}) {
         if (output.text !== result.text) {
             console.log('🔄 检测到繁体字，已转换为简体中文');
         }
+        
+        // 注意：不需要手动设置 audioData 和 output 为 null
+        // JavaScript 垃圾回收器会自动处理不再引用的变量
         
         return result;
         
@@ -567,6 +590,9 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         if (output.text !== result.text) {
             console.log('🔄 检测到繁体字，已转换为简体中文');
         }
+        
+        // 注意：不需要手动设置 audioData 和 output 为 null
+        // JavaScript 垃圾回收器会自动处理不再引用的变量
         
         return result;
         

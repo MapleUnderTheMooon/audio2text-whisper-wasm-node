@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "start:cluster": "node cluster-manager.js",
     "dev": "node --watch server.js",
     "test": "node test.js",
     "quick": "node quick_start.js",
