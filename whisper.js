@@ -93,6 +93,12 @@ async function decodeAudioBuffer(buffer, ext = null, mimetype = null) {
         } else if (ext === '.webm' || mimetype.includes('webm')) {
             // 处理 WebM/Opus 格式
             console.log(`📊 WebM文件信息: 大小=${(buffer.length / 1024).toFixed(2)}KB, MIME类型=${mimetype}`);
+            
+            // 验证WebM文件完整性
+            if (!validateWebM(buffer)) {
+                console.warn(`⚠️  警告: 可能不是有效的WebM文件，尝试继续处理...`);
+            }
+            
             console.log(`🔄 开始解码 WebM/Opus 格式...`);
             
             try {
@@ -167,6 +173,59 @@ function resampleAudio(audioData, originalRate, targetRate) {
     }
     
     return resampled;
+}
+
+// 评估音频质量
+function evaluateAudioQuality(audioData) {
+    // 优化：避免在大音频数据上进行昂贵的操作
+    // 只处理前10秒音频数据（16000Hz * 10s = 160000 samples）
+    const maxSamples = 16000 * 10;
+    const sampleData = audioData.length > maxSamples ? 
+        audioData.slice(0, maxSamples) : audioData;
+    
+    // 计算均方根（RMS）音量
+    let sum = 0;
+    for (let i = 0; i < sampleData.length; i++) {
+        sum += sampleData[i] * sampleData[i];
+    }
+    const rms = Math.sqrt(sum / sampleData.length);
+    
+    // 计算峰值音量
+    let peak = 0;
+    for (let i = 0; i < sampleData.length; i++) {
+        const absSample = Math.abs(sampleData[i]);
+        if (absSample > peak) {
+            peak = absSample;
+        }
+    }
+    
+    // 简单评估：检测音量、信噪比等
+    const isLowQuality = rms < 0.01; // 音量过低
+    const isLowPeak = peak < 0.1;    // 峰值过低
+    
+    return {
+        rms,
+        peak,
+        isLowQuality,
+        isLowPeak,
+        qualityScore: Math.min(1.0, Math.max(0.0, rms * 10)) // 0-1 质量评分
+    };
+}
+
+// 根据音频质量调整预处理参数
+function getPreprocessingParams(audioQuality) {
+    if (audioQuality.isLowQuality || audioQuality.isLowPeak) {
+        return {
+            noiseReduction: "afftdn=nf=-30", // 更强的降噪
+            volume: "volume=3",            // 更大的增益
+            compression: "dynaudnorm=f=200"  // 更强的动态压缩
+        };
+    }
+    return {
+        noiseReduction: "afftdn=nf=-20", // 标准降噪
+        volume: "volume=1.5",            // 适度增益
+        compression: "dynaudnorm"        // 标准动态压缩
+    };
 }
 
 // 使用 FFmpeg 解码 WebM 文件
@@ -245,6 +304,7 @@ async function decodeWebMWithFFmpeg(buffer) {
         const ffmpegPathEscaped = escapePath(ffmpegPath);
         
         // 构建命令，使用双引号包裹所有路径
+        // 简化：移除可能不兼容的滤镜，确保基本功能正常
         const command = `"${ffmpegPathEscaped}" -i "${inputPathEscaped}" -ar 16000 -ac 1 -f wav -acodec pcm_s16le -y "${outputPathEscaped}"`;
         
         console.log('🔄 正在使用 FFmpeg 转换 WebM 文件...');
@@ -343,6 +403,18 @@ async function decodeWebMWithOpusDecoder(buffer) {
     // 这个实现目前不支持直接解码 WebM 容器
     // 建议使用 FFmpeg 进行解码
     throw new Error('Opus 解码器需要先解析 WebM 容器，请使用 FFmpeg 进行解码');
+}
+
+// 验证WebM文件完整性
+function validateWebM(buffer) {
+    // 检查WebM文件头
+    if (buffer.length < 4) {
+        return false;
+    }
+    
+    // WebM文件的魔术数字是0x1a45dfa3
+    const webmSignature = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
+    return buffer.subarray(0, 4).equals(webmSignature);
 }
 
 // 手动WAV文件解析（备选方案）
@@ -489,9 +561,15 @@ class WhisperPipelineFactory {
     static async getInstance(progressCallback = null) {
         if (this.instance === null) {
             console.log('🧠 正在加载 Whisper 模型...');
+            console.log('📦 模型名称:', this.model);
+            console.log('🔢 量化选项:', this.quantized);
+            
             this.instance = await pipeline(this.task, this.model, {
                 quantized: this.quantized,
                 progress_callback: progressCallback,
+                
+                // 关键修复：明确指定模型类型为 whisper，避免系统错误选择 CTC 架构
+                model_type: 'whisper',
                 
                 // 对于中等模型，需要加载 no_attentions 版本以避免内存不足
                 revision: this.model.includes('/whisper-medium') ? 'no_attentions' : 'main'
@@ -614,14 +692,28 @@ export async function audioToText(audioPath, options = {}) {
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
         
-                // 执行转录 - 确保传入正确的音频格式
+                // 评估音频质量
+        const audioQuality = evaluateAudioQuality(audioData);
+        console.log('📊 音频质量评估:', {
+            rms: audioQuality.rms.toFixed(6),
+            peak: audioQuality.peak.toFixed(6),
+            qualityScore: audioQuality.qualityScore.toFixed(2),
+            isLowQuality: audioQuality.isLowQuality,
+            isLowPeak: audioQuality.isLowPeak
+        });
+        
+        // 执行转录 - 确保传入正确的音频格式
         let output;
         
         // 构建转录配置
         const transcribeConfig = {
-            // Greedy 搜索
-            top_k: 0,
-            do_sample: false,
+            // 根据音频质量调整解码策略
+            top_k: audioQuality.isLowQuality ? 5 : 0,
+            top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
+            temperature: audioQuality.isLowQuality ? 0.1 : 0.0,
+            beam_size: audioQuality.isLowQuality ? 5 : 1,
+            patience: audioQuality.isLowQuality ? 1.5 : 1.0,
+            length_penalty: 1.0,
             
             // 滑动窗口
             chunk_length_s: isDistilWhisper ? 20 : 30,
@@ -641,27 +733,39 @@ export async function audioToText(audioPath, options = {}) {
                 if (lastChunk && lastChunk.output_token_ids) {
                     console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
                 }
-            }
+            },
+            
+            // 其他优化
+            compression_ratio_threshold: 2.4,
+            logprob_threshold: -1.0,
+            no_speech_threshold: 0.6
         };
         
         try {
+            let transcriptionInput = audioData;
+            
+            // 转换为合适的格式
             if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
-                // 如果已经是 Float32Array 或 Float64Array，直接传递
+                // 如果已经是 Float32Array 或 Float64Array，直接使用
                 console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
-                output = await transcriber(audioData, transcribeConfig);
             } else if (audioData instanceof Buffer) {
-                // 如果是 Buffer，将其转换为 ArrayBuffer 后直接传递
+                // 如果是 Buffer，将其转换为 ArrayBuffer 后使用
                 console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
-                const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
-                output = await transcriber(arrayBuffer, transcribeConfig);
+                transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
             } else if (audioData instanceof ArrayBuffer) {
-                // 如果是 ArrayBuffer，直接传递
+                // 如果是 ArrayBuffer，直接使用
                 console.log('🎯 音频数据为 ArrayBuffer，直接传递');
-                output = await transcriber(audioData, transcribeConfig);
             } else {
-                // 其他情况，直接传递
+                // 其他情况，直接使用
                 console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
-                output = await transcriber(audioData, transcribeConfig);
+            }
+            
+            // 使用带有重试机制的转录函数
+            output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
+            
+            // 如果重试后仍然没有结果，抛出错误
+            if (!output) {
+                throw new Error('所有转录尝试均失败，结果质量不满足要求');
             }
         } catch (transcribeError) {
             console.error('❌ 转录过程出错:', transcribeError.message);
@@ -821,12 +925,28 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
         
+        // 评估音频质量
+        const audioQuality = evaluateAudioQuality(audioData);
+        console.log('📊 音频质量评估:', {
+            rms: audioQuality.rms.toFixed(6),
+            peak: audioQuality.peak.toFixed(6),
+            qualityScore: audioQuality.qualityScore.toFixed(2),
+            isLowQuality: audioQuality.isLowQuality,
+            isLowPeak: audioQuality.isLowPeak
+        });
+        
         // 执行转录 - 确保传入正确的音频格式
         let output;
+        
+        // 优化：根据音频质量调整解码参数
         const transcribeConfig = {
-            // Greedy 搜索
-            top_k: 0,
-            do_sample: false,
+            // 根据音频质量调整解码策略
+            top_k: audioQuality.isLowQuality ? 5 : 0,
+            top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
+            temperature: audioQuality.isLowQuality ? 0.1 : 0.0,
+            beam_size: audioQuality.isLowQuality ? 5 : 1,
+            patience: audioQuality.isLowQuality ? 1.5 : 1.0,
+            length_penalty: 1.0,
             
             // 滑动窗口
             chunk_length_s: isDistilWhisper ? 20 : 30,
@@ -838,26 +958,38 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
             
             // 返回时间戳
             return_timestamps: true,
+            
+            // 其他优化
+            compression_ratio_threshold: 2.4,
+            logprob_threshold: -1.0,
+            no_speech_threshold: 0.6
         };
         
         try {
+            let transcriptionInput = audioData;
+            
+            // 转换为合适的格式
             if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
-                // 如果已经是 Float32Array 或 Float64Array，直接传递
+                // 如果已经是 Float32Array 或 Float64Array，直接使用
                 console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
-                output = await transcriber(audioData, transcribeConfig);
             } else if (audioData instanceof Buffer) {
-                // 如果是 Buffer，转换为 ArrayBuffer 后直接传递
+                // 如果是 Buffer，将其转换为 ArrayBuffer 后使用
                 console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
-                const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
-                output = await transcriber(arrayBuffer, transcribeConfig);
+                transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
             } else if (audioData instanceof ArrayBuffer) {
-                // 如果是 ArrayBuffer，直接传递
+                // 如果是 ArrayBuffer，直接使用
                 console.log('🎯 音频数据为 ArrayBuffer，直接传递');
-                output = await transcriber(audioData, transcribeConfig);
             } else {
-                // 其他情况，直接传递
+                // 其他情况，直接使用
                 console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
-                output = await transcriber(audioData, transcribeConfig);
+            }
+            
+            // 使用带有重试机制的转录函数
+            output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
+            
+            // 如果重试后仍然没有结果，抛出错误
+            if (!output) {
+                throw new Error('所有转录尝试均失败，结果质量不满足要求');
             }
         } catch (transcribeError) {
             console.error('❌ 转录过程出错:', transcribeError.message);
@@ -1028,6 +1160,75 @@ function calculateConfidence(chunks) {
     }, 0);
     
     return Math.max(0.1, Math.min(1.0, (totalConfidence / chunks.length + 1) / 2));
+}
+
+// 验证转录结果质量
+function validateTranscription(result) {
+    if (!result) {
+        return false;
+    }
+    
+    // 检查是否有文本输出
+    const hasText = result.text && result.text.trim().length > 0;
+    if (!hasText) {
+        return false;
+    }
+    
+    // 放宽验证标准：只检查是否有文本，不检查置信度和长度
+    return true;
+}
+
+// 带有重试机制的转录函数
+async function transcribeWithRetry(transcriber, audioData, config, maxRetries = 2) {
+    let attempt = 0;
+    let result = null;
+    
+    // 复制原始配置，避免修改原始对象
+    const originalConfig = { ...config };
+    
+    while (attempt <= maxRetries && !result) {
+        try {
+            console.log(`📝 转录尝试 ${attempt + 1}/${maxRetries + 1}`);
+            
+            // 每次尝试使用新的配置对象
+            const attemptConfig = { ...originalConfig };
+            
+            // 根据尝试次数调整参数
+            if (attempt > 0) {
+                console.log(`🔧 调整解码参数，尝试第 ${attempt + 1} 次`);
+                // 只调整必要的参数，避免冲突
+                attemptConfig.temperature = 0.2;
+                attemptConfig.beam_size = 5;
+                attemptConfig.patience = 1.0;
+            }
+            
+            // 执行转录
+            result = await transcriber(audioData, attemptConfig);
+            
+            // 验证转录结果（放宽验证标准）
+            if (result && result.text && result.text.trim().length > 0) {
+                const confidence = result.confidence || calculateConfidence(result.chunks || []);
+                console.log(`✅ 转录尝试 ${attempt + 1} 成功，置信度: ${confidence.toFixed(3)}`);
+                return result;
+            } else {
+                console.log(`⚠️  转录尝试 ${attempt + 1} 结果质量不高，尝试调整参数重试...`);
+                // 重置结果
+                result = null;
+            }
+        } catch (error) {
+            console.error(`❌ 转录尝试 ${attempt + 1} 失败:`, error.message);
+            
+            // 如果是参数冲突错误，直接返回当前结果
+            if (error.message.includes('Cannot specify')) {
+                console.log(`⚠️  参数冲突，直接返回当前结果`);
+                return result;
+            }
+        }
+        
+        attempt++;
+    }
+    
+    return result;
 }
 
 // 获取支持的模型列表
