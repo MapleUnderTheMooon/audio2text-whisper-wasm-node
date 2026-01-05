@@ -139,7 +139,7 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
         const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => {
                 reject(new Error('TIMEOUT'));
-            }, 2000); // 2秒超时
+            }, 5000); // 5秒超时
         });
 
         // 直接从内存缓冲区处理音频数据，使用 Promise.race 实现超时
@@ -191,7 +191,7 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
             return res.status(408).json({
                 success: false,
                 error: '转录超时',
-                message: '处理时间超过2秒，已丢弃',
+                message: '处理时间超过5秒，已丢弃',
                 code: 'TIMEOUT'
             });
         }
@@ -244,7 +244,7 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
         const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => {
                 reject(new Error('TIMEOUT'));
-            }, 2000); // 2秒超时
+            }, 5000); // 5秒超时
         });
 
         // 直接从内存缓冲区批量处理音频数据，使用 Promise.race 实现超时
@@ -299,7 +299,7 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
             return res.status(408).json({
                 success: false,
                 error: '批量转录超时',
-                message: '处理时间超过2秒，已丢弃',
+                message: '处理时间超过5秒，已丢弃',
                 code: 'TIMEOUT'
             });
         }

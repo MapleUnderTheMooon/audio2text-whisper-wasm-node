@@ -23,7 +23,8 @@
         CACHE_DURATION: 60000, // 字幕缓存时长：60秒
         DELAY_MULTIPLIER: 1, // 延迟倍数，1表示完全抵消延迟，可调节
         SUBTITLE_BASE_DURATION: 5000, // 字幕基础显示时间（毫秒）
-        SUBTITLE_CHAR_DURATION: 300 // 每个字符额外显示时间（毫秒）
+        SUBTITLE_CHAR_DURATION: 300, // 每个字符额外显示时间（毫秒）
+        MAX_BUFFER_SIZE: 50 * 1024 * 1024 // 最大缓冲区大小：50MB
     };
 
     // 核心状态管理
@@ -48,12 +49,72 @@
         subtitleBaseDuration: 5000, // 字幕基础显示时间
         subtitleCharDuration: 300, // 每个字符额外显示时间
         audioQueue: [], // 音频数据队列
-        maxQueueSize: 10, // 最大队列长度
+        maxQueueSize: 5, // 最大队列长度（减少到5个，防止积压）
         processingTimeout: null, // 处理超时定时器
+        queueCleanupTimeout: null, // 队列清理定时器
+        lastProcessTime: 0, // 上次成功处理时间
+        processingFailures: 0, // 连续处理失败次数
         subtitleHideTimeout: null, // 字幕隐藏超时定时器
         lastSubtitleText: '', // 上次显示的字幕文本
         lastSubtitleTime: 0, // 上次显示字幕的时间
-        isSameSubtitle: false // 是否是相同的字幕
+        isSameSubtitle: false, // 是否是相同的字幕
+        notificationElement: null, // 通知元素
+        notificationTimeout: null, // 通知隐藏定时器
+        isEnabled: false, // 字幕功能是否启用
+        isVideoPlaying: false // 视频是否正在播放
+    };
+
+    // 缓冲区管理
+    const bufferManager = {
+        // 检查并清理缓冲区（FIFO策略）
+        checkAndCleanupBuffer() {
+            const currentSize = calculateAudioDataSize(state.audioAccumulator);
+            const maxSize = CONFIG.MAX_BUFFER_SIZE;
+
+            // 如果未超过限制，无需清理
+            if (currentSize <= maxSize) {
+                return false;
+            }
+
+            logger.warn(`缓冲区超限: ${formatFileSize(currentSize)} > ${formatFileSize(maxSize)}，开始FIFO清理`);
+
+            // 计算需要删除多少个音频块才能回到限制以内
+            // 目标是保留75%的限制大小，给后续数据留出空间
+            const targetSize = Math.floor(maxSize * 0.75);
+            let accumulatedSize = 0;
+            let itemsToRemove = 0;
+
+            // 计算需要删除多少项
+            for (let i = 0; i < state.audioAccumulator.length; i++) {
+                const itemSize = state.audioAccumulator[i].length * 2; // Int16Array每个元素2字节
+                if (accumulatedSize + itemSize > targetSize) {
+                    break;
+                }
+                accumulatedSize += itemSize;
+                itemsToRemove = i + 1;
+            }
+
+            // 执行FIFO删除
+            if (itemsToRemove > 0 && itemsToRemove < state.audioAccumulator.length) {
+                const removedCount = state.audioAccumulator.length - itemsToRemove;
+                state.audioAccumulator = state.audioAccumulator.slice(itemsToRemove);
+                state.accumulatorSize -= removedCount * (state.audioAccumulator[0]?.length || 0);
+
+                // 如果有段开始时间，更新为第一个保留项的开始时间
+                if (state.audioAccumulator.length > 0) {
+                    // 估算被删除的时间段
+                    const removedDuration = (removedCount * CONFIG.BUFFER_SIZE) / CONFIG.SAMPLE_RATE;
+                    state.segmentStartTime = state.videoElement.currentTime - removedDuration;
+                } else {
+                    state.segmentStartTime = null;
+                }
+
+                logger.warn(`FIFO清理完成: 删除了 ${removedCount} 个音频块，当前大小: ${formatFileSize(calculateAudioDataSize(state.audioAccumulator))}`);
+                return true;
+            }
+
+            return false;
+        }
     };
 
     // 日志工具
@@ -66,6 +127,106 @@
         },
         error: (...args) => {
             console.error('[ERROR]', ...args);
+        },
+        warn: (...args) => {
+            console.warn('[WARN]', ...args);
+        }
+    };
+
+    // 系统状态监控
+    const systemMonitor = {
+        startTime: Date.now(),
+        lastCheckTime: Date.now(),
+        memoryWarnings: 0,
+
+        // 检查系统状态
+        checkStatus() {
+            const now = Date.now();
+            const memoryUsage = performance.memory ?
+                performance.memory.usedJSHeapSize / 1024 / 1024 : 0;
+
+            // 检查缓冲区使用率
+            const bufferSize = calculateAudioDataSize(state.audioAccumulator);
+            const bufferUsagePercent = (bufferSize / CONFIG.MAX_BUFFER_SIZE) * 100;
+
+            // 如果缓冲区使用超过80%，发出警告
+            if (bufferUsagePercent > 80) {
+                logger.warn(`⚠️ 缓冲区使用过高: ${bufferUsagePercent.toFixed(1)}% (${formatFileSize(bufferSize)})`);
+
+                // 如果缓冲区使用超过90%，强制清理
+                if (bufferUsagePercent > 90) {
+                    logger.error('🚨 缓冲区严重超载，强制清理');
+                    bufferManager.checkAndCleanupBuffer();
+                }
+            }
+
+            // 如果内存使用超过100MB且超过1分钟没有成功处理，发出警告
+            if (memoryUsage > 100 &&
+                (state.lastProcessTime === 0 || now - state.lastProcessTime > 60000)) {
+                this.memoryWarnings++;
+                logger.warn(`⚠️ 内存使用警告: ${memoryUsage.toFixed(2)}MB, 成功处理时间: ${state.lastProcessTime ? new Date(state.lastProcessTime).toLocaleTimeString() : '无'}`);
+
+                // 如果连续3次内存警告，强制清理
+                if (this.memoryWarnings >= 3) {
+                    this.forceCleanup();
+                }
+            }
+
+            // 每30秒输出一次系统状态（更频繁的监控）
+            if (now - this.lastCheckTime > 30000) {
+                this.logStatus();
+                this.lastCheckTime = now;
+            }
+        },
+
+        // 记录系统状态
+        logStatus() {
+            const runtime = (Date.now() - this.startTime) / 1000;
+            const memoryUsage = performance.memory ?
+                performance.memory.usedJSHeapSize / 1024 / 1024 : 0;
+            const bufferSize = calculateAudioDataSize(state.audioAccumulator);
+            const maxBufferSize = CONFIG.MAX_BUFFER_SIZE;
+            const bufferUsage = (bufferSize / maxBufferSize * 100).toFixed(1);
+
+            logger.info(`📊 系统状态 - 运行时间: ${runtime.toFixed(0)}s, 内存: ${memoryUsage.toFixed(2)}MB, 队列: ${state.audioQueue.length}, 失败: ${state.processingFailures}, 缓冲区: ${formatFileSize(bufferSize)} (${bufferUsage}%)`);
+        },
+
+        // 强制清理
+        forceCleanup() {
+            logger.error('🚨 强制清理系统资源');
+
+            // 隐藏用户通知
+            hideUserNotification();
+
+            // 清空音频队列
+            const queueLength = state.audioQueue.length;
+            state.audioQueue = [];
+
+            // 重置状态
+            state.processingFailures = 0;
+            state.isProcessing = false;
+
+            // 清理定时器
+            if (state.processingTimeout) {
+                clearTimeout(state.processingTimeout);
+                state.processingTimeout = null;
+            }
+
+            if (state.queueCleanupTimeout) {
+                clearTimeout(state.queueCleanupTimeout);
+                state.queueCleanupTimeout = null;
+            }
+
+            // 清理字幕队列
+            state.subtitleQueue = [];
+
+            // 隐藏字幕
+            hideSubtitle();
+
+            logger.warn(`✅ 强制清理完成 - 清空了 ${queueLength} 个音频项`);
+
+            // 重置警告计数
+            this.memoryWarnings = 0;
         }
     };
 
@@ -212,6 +373,50 @@
         if (!state.isProcessing) {
             processQueuedAudio();
         }
+
+        // 启动队列清理定时器（如果尚未启动）
+        scheduleQueueCleanup();
+    }
+
+    // 调度队列清理
+    function scheduleQueueCleanup() {
+        // 清理已存在的定时器
+        if (state.queueCleanupTimeout) {
+            clearTimeout(state.queueCleanupTimeout);
+        }
+
+        // 10秒后清理队列
+        state.queueCleanupTimeout = setTimeout(() => {
+            cleanupStaleQueueItems();
+        }, 10000);
+    }
+
+    // 清理过期的队列项
+    function cleanupStaleQueueItems() {
+        const now = Date.now();
+        const originalLength = state.audioQueue.length;
+
+        // 清理超过15秒未处理的音频项
+        state.audioQueue = state.audioQueue.filter(item =>
+            now - item.timestamp < 15000
+        );
+
+        // 如果清理了项目，记录日志
+        if (state.audioQueue.length < originalLength) {
+            logger.warn(`清理了 ${originalLength - state.audioQueue.length} 个过期音频项，当前队列长度: ${state.audioQueue.length}`);
+
+            // 如果清理后队列仍然很长，可能是后端有问题，重置失败计数并强制清空
+            if (state.audioQueue.length > 3) {
+                logger.error('检测到严重积压，强制清空队列');
+                state.audioQueue = [];
+                state.processingFailures = 0;
+            }
+        }
+
+        // 如果还有队列项，重新调度清理
+        if (state.audioQueue.length > 0) {
+            scheduleQueueCleanup();
+        }
     }
 
     // 处理队列中的下一个音频
@@ -232,12 +437,24 @@
 
         logger.debug('accumulateAudioData 被调用，输入样本数:', float32Array.length);
 
-        // 将 Float32 转换为 Int16 PCM
-        const int16Array = floatTo16BitPCM(float32Array);
+        // 音频增强处理
+        const enhancedData = enhanceAudio(float32Array);
+
+        // 将增强后的 Float32 转换为 Int16 PCM
+        const int16Array = floatTo16BitPCM(enhancedData);
 
         // 累积到缓冲区
         state.audioAccumulator.push(int16Array);
         state.accumulatorSize += int16Array.length;
+
+        // 检查并清理缓冲区（FIFO策略）
+        const currentBufferSize = calculateAudioDataSize(state.audioAccumulator);
+        logger.debug(`当前缓冲区大小: ${formatFileSize(currentBufferSize)}`);
+
+        // 如果缓冲区超过限制，进行FIFO清理
+        if (currentBufferSize > CONFIG.MAX_BUFFER_SIZE) {
+            bufferManager.checkAndCleanupBuffer();
+        }
 
         // 使用自适应累积时长
         const adaptiveDuration = getAdaptiveAccumulateDuration();
@@ -259,12 +476,10 @@
 
         state.isProcessing = true;
 
-        // 设置处理超时（5秒）
+        // 设置处理超时（3秒，缩短超时时间）
         state.processingTimeout = setTimeout(() => {
-            logger.warn('音频处理超时，强制结束');
-            state.isProcessing = false;
-            processNextAudio();
-        }, 5000);
+            handleProcessingTimeout();
+        }, 3000);
 
         try {
             // 从队列取出音频数据
@@ -320,13 +535,19 @@
 
                     // 兼容旧的缓存方式
                     saveSubtitleToCache({ text, timestamp: Date.now() });
+
+                    // 重置失败计数
+                    state.processingFailures = 0;
+                    state.lastProcessTime = Date.now();
                 } else {
                     logger.warn('后端返回空文本，可能存在时间戳问题');
+                    state.processingFailures++;
                 }
             }
 
         } catch (error) {
             logger.error('处理队列音频失败:', error);
+            state.processingFailures++;
         } finally {
             // 清理超时定时器
             if (state.processingTimeout) {
@@ -337,8 +558,49 @@
             state.isProcessing = false;
             logger.debug('音频处理完成，处理下一个队列项');
 
+            // 检查是否需要清理队列
+            checkAndHandleQueuePressure();
+
+            // 检查系统状态
+            systemMonitor.checkStatus();
+
             // 处理队列中的下一个音频
             processNextAudio();
+        }
+    }
+
+    // 处理超时情况
+    function handleProcessingTimeout() {
+        logger.warn('音频处理超时');
+
+        // 增加失败计数
+        state.processingFailures++;
+
+        // 如果连续失败3次，认为后端有问题，清空队列
+        if (state.processingFailures >= 3) {
+            logger.error('连续多次处理失败，清空队列以防止积压');
+            const queueLength = state.audioQueue.length;
+            state.audioQueue = [];
+            state.processingFailures = 0;
+            logger.warn(`已清空 ${queueLength} 个未处理的音频项`);
+        } else {
+            logger.warn(`处理失败次数: ${state.processingFailures}/3`);
+        }
+
+        state.isProcessing = false;
+        processNextAudio();
+    }
+
+    // 检查并处理队列压力
+    function checkAndHandleQueuePressure() {
+        const now = Date.now();
+
+        // 如果队列过长，且最近没有成功处理过
+        if (state.audioQueue.length > 3 &&
+            (state.lastProcessTime === 0 || now - state.lastProcessTime > 10000)) {
+            logger.warn('检测到队列压力过大，清空队列');
+            state.audioQueue = [];
+            state.processingFailures = 0;
         }
     }
 
@@ -544,6 +806,92 @@
         }
     }
 
+    // 创建通知容器
+    function createNotificationContainer() {
+        // 检查是否已经存在
+        let existingNotification = document.getElementById('subtitle-notification');
+        if (existingNotification) {
+            return existingNotification;
+        }
+
+        // 创建新的通知容器
+        const notification = document.createElement('div');
+        notification.id = 'subtitle-notification';
+        notification.style.cssText = `
+            position: fixed;
+            top: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000000;
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: white;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+            max-width: 300px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        `;
+
+        document.body.appendChild(notification);
+        return notification;
+    }
+
+    // 显示用户通知
+    function showUserNotification(message, type = 'info') {
+        // 创建或获取通知元素
+        if (!state.notificationElement) {
+            state.notificationElement = createNotificationContainer();
+        }
+
+        // 清除之前的定时器
+        if (state.notificationTimeout) {
+            clearTimeout(state.notificationTimeout);
+        }
+
+        // 设置通知样式和内容
+        state.notificationElement.textContent = message;
+
+        switch (type) {
+            case 'warning':
+                state.notificationElement.style.background = 'rgba(255, 152, 0, 0.95)'; // 橙色
+                break;
+            case 'error':
+                state.notificationElement.style.background = 'rgba(244, 67, 54, 0.95)'; // 红色
+                break;
+            case 'success':
+                state.notificationElement.style.background = 'rgba(76, 175, 80, 0.95)'; // 绿色
+                break;
+            case 'info':
+            default:
+                state.notificationElement.style.background = 'rgba(33, 150, 243, 0.95)'; // 蓝色
+                break;
+        }
+
+        // 显示通知
+        state.notificationElement.style.opacity = '1';
+
+        // 3秒后自动隐藏
+        state.notificationTimeout = setTimeout(() => {
+            hideUserNotification();
+        }, 3000);
+    }
+
+    // 隐藏用户通知
+    function hideUserNotification() {
+        if (state.notificationElement && state.notificationElement.style.opacity !== '0') {
+            state.notificationElement.style.opacity = '0';
+
+            if (state.notificationTimeout) {
+                clearTimeout(state.notificationTimeout);
+                state.notificationTimeout = null;
+            }
+        }
+    }
+
     // 启动字幕显示检查器
     function startSubtitleDisplayChecker() {
         if (state.displayCheckInterval) {
@@ -553,9 +901,28 @@
 
         logger.info('启动字幕显示检查器');
         state.displayCheckInterval = setInterval(() => {
-            if (!state.videoElement || !state.isPlaying) {
+            // 检查视频是否存在和播放状态
+            if (!state.videoElement) {
                 hideSubtitle();
+                showUserNotification('未检测到视频元素', 'warning');
                 return;
+            }
+
+            // 如果视频暂停，隐藏字幕并显示提示
+            if (state.videoElement.paused || state.videoElement.ended) {
+                if (state.isPlaying) {
+                    hideSubtitle();
+                    showUserNotification('视频已暂停，字幕功能已暂停', 'info');
+                    state.isPlaying = false;
+                }
+                return;
+            }
+
+            // 如果视频在播放但状态未更新，更新状态
+            if (!state.isPlaying) {
+                state.isPlaying = true;
+                logger.info('检测到视频播放，恢复字幕功能');
+                hideUserNotification();
             }
 
             const currentTime = state.videoElement.currentTime;
@@ -596,6 +963,148 @@
             state.displayCheckInterval = null;
             logger.info('字幕显示检查器已停止');
         }
+    }
+
+    // 计算音频数据内存占用（字节）
+    function calculateAudioDataSize(audioData) {
+        // audioData 是 Int16Array 的数组
+        let totalSize = 0;
+        for (const array of audioData) {
+            // Int16Array 每个元素占2字节
+            totalSize += array.length * 2;
+        }
+        return totalSize;
+    }
+
+    // 格式化字节大小为可读字符串
+    function formatFileSize(bytes) {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    // ========== 音频增强辅助 ==========
+
+    // 预加重滤波（增强高频，提升语音清晰度）
+    function preEmphasis(audioData, alpha = 0.97) {
+        const emphasized = new Float32Array(audioData.length);
+        emphasized[0] = audioData[0]; // 第一个样本保持不变
+
+        for (let i = 1; i < audioData.length; i++) {
+            emphasized[i] = audioData[i] - alpha * audioData[i - 1];
+        }
+
+        // 计算高频增益
+        const highFreqEnergy = emphasized.slice(emphasized.length / 2)
+            .reduce((sum, val) => sum + val * val, 0);
+        const originalEnergy = audioData.slice(audioData.length / 2)
+            .reduce((sum, val) => sum + val * val, 0);
+
+        const highFreqGain = originalEnergy > 0 ? highFreqEnergy / originalEnergy : 1;
+
+        console.log(`🌊 预加重滤波: 高频增益 ${highFreqGain.toFixed(2)} (α=${alpha})`);
+
+        return emphasized;
+    }
+
+    // 计算音频的 RMS 值
+    function calculateRMS(audioData) {
+        let sum = 0;
+        for (let i = 0; i < audioData.length; i++) {
+            sum += audioData[i] * audioData[i];
+        }
+        return Math.sqrt(sum / audioData.length);
+    }
+
+    // 音量标准化
+    function normalizeAudio(audioData) {
+        const currentRMS = calculateRMS(audioData);
+        // 目标 RMS 为 0.1（约 -20dB）
+        const targetRMS = 0.1;
+
+        // 计算增益，限制在合理范围内
+        let gain = targetRMS / currentRMS;
+        gain = Math.max(0.5, Math.min(3.0, gain)); // 限制增益在 0.5-3.0 之间
+
+        // 应用增益
+        const normalized = new Float32Array(audioData.length);
+        for (let i = 0; i < audioData.length; i++) {
+            normalized[i] = audioData[i] * gain;
+        }
+
+        // 检查削波
+        const peak = Math.max(...normalized.map(Math.abs));
+        if (peak > 0.95) {
+            // 防止削波，降低增益
+            const safeGain = 0.95 / peak;
+            for (let i = 0; i < normalized.length; i++) {
+                normalized[i] *= safeGain;
+            }
+        }
+
+        console.log(`🔊 音量标准化: ${currentRMS.toFixed(4)} → ${calculateRMS(normalized).toFixed(4)} (增益: ${gain.toFixed(2)})`);
+
+        return normalized;
+    }
+
+    // 简单的带通滤波器
+    function bandPassFilter(audioData) {
+        const sampleRate = CONFIG.SAMPLE_RATE;
+        const lowCut = 80;    // 低频截止
+        const highCut = 3800; // 高频截止
+
+        // 归一化频率
+        const low = 2 * Math.PI * lowCut / sampleRate;
+        const high = 2 * Math.PI * highCut / sampleRate;
+
+        // 简单的 IIR 滤波实现
+        const filtered = new Float32Array(audioData.length);
+
+        // 低通部分
+        let y1_lp = 0, y2_lp = 0;
+        const alpha1 = Math.exp(-high);
+        for (let i = 0; i < audioData.length; i++) {
+            y1_lp = alpha1 * y1_lp + (1 - alpha1) * audioData[i];
+            y2_lp = alpha1 * y2_lp + (1 - alpha1) * y1_lp;
+            filtered[i] = y2_lp;
+        }
+
+        // 高通部分
+        let y1_hp = 0, y2_hp = 0;
+        const alpha2 = Math.exp(-low);
+        for (let i = 0; i < audioData.length; i++) {
+            y1_hp = alpha2 * y1_hp + (1 - alpha2) * filtered[i];
+            y2_hp = alpha2 * y2_hp + (1 - alpha2) * y1_hp;
+            filtered[i] = filtered[i] - y2_hp;
+        }
+
+        console.log(`🎚️  带通滤波: ${lowCut}Hz-${highCut}Hz`);
+
+        return filtered;
+    }
+
+    // 音频增强处理
+    function enhanceAudio(audioData) {
+        // 1. 预加重滤波（增强高频）
+        let enhanced = preEmphasis(audioData);
+
+        // 2. 音量标准化
+        enhanced = normalizeAudio(enhanced);
+
+        // 3. 带通滤波
+        enhanced = bandPassFilter(enhanced);
+
+        // 4. 计算最终指标
+        const finalRMS = calculateRMS(enhanced);
+        const peak = Math.max(...enhanced.map(Math.abs));
+
+        console.log(`✅ 音频增强完成`);
+        console.log(`   - RMS: ${finalRMS.toFixed(4)} (${(20 * Math.log10(finalRMS)).toFixed(1)}dB)`);
+        console.log(`   - 峰值: ${(peak * 100).toFixed(1)}%`);
+
+        return enhanced;
     }
 
     // 初始化音频捕获
@@ -698,25 +1207,45 @@
     }
 
     // 停止音频捕获
-    function stopAudioCapture() {
+    function stopAudioCapture(isVideoPaused = false) {
         state.isRecording = false;
 
-        // 处理剩余的队列数据
-        if (state.audioQueue.length > 0) {
-            logger.info(`停止捕获时，队列中还有 ${state.audioQueue.length} 个音频段待处理`);
+        // 如果是视频暂停导致的停止，直接清空所有数据，不处理剩余项
+        if (isVideoPaused) {
+            logger.info('视频暂停，清空所有音频数据');
 
-            // 处理剩余的音频数据
-            while (state.audioQueue.length > 0) {
-                setTimeout(() => {
-                    processQueuedAudio();
-                }, 0);
+            // 清空音频队列
+            if (state.audioQueue.length > 0) {
+                logger.debug(`视频暂停，丢弃 ${state.audioQueue.length} 个队列中的音频段`);
+                state.audioQueue = [];
             }
-        }
 
-        // 处理当前累积的音频数据
-        if (state.audioAccumulator.length > 0) {
-            logger.info('停止捕获时，还有未处理的累积音频，加入队列');
-            queueAudioForProcessing();
+            // 清空累积缓冲区
+            if (state.audioAccumulator.length > 0) {
+                logger.debug('视频暂停，清空累积的音频数据');
+                state.audioAccumulator = [];
+                state.accumulatorSize = 0;
+                state.segmentStartTime = null;
+            }
+        } else {
+            // 正常停止时的处理（如关闭页面）
+            // 处理剩余的队列数据
+            if (state.audioQueue.length > 0) {
+                logger.info(`停止捕获时，队列中还有 ${state.audioQueue.length} 个音频段待处理`);
+
+                // 处理剩余的音频数据
+                while (state.audioQueue.length > 0) {
+                    setTimeout(() => {
+                        processQueuedAudio();
+                    }, 0);
+                }
+            }
+
+            // 处理当前累积的音频数据
+            if (state.audioAccumulator.length > 0) {
+                logger.info('停止捕获时，还有未处理的累积音频，加入队列');
+                queueAudioForProcessing();
+            }
         }
 
         // 清理超时定时器
@@ -751,27 +1280,41 @@
     function handleVideoPlay() {
         logger.info('视频开始播放，启动字幕生成');
         state.isPlaying = true;
+        state.isVideoPlaying = true;
 
-        // 初始化音频捕获
-        initAudioCapture();
+        // 如果字幕已启用，启动字幕系统
+        if (state.isEnabled) {
+            // 初始化音频捕获
+            initAudioCapture();
 
-        // 启动字幕显示检查器
-        startSubtitleDisplayChecker();
+            // 启动字幕显示检查器
+            startSubtitleDisplayChecker();
+
+            // 更新按钮状态
+            updateButtonText();
+        }
     }
 
     // 视频暂停事件处理
     function handleVideoPause() {
         logger.info('视频暂停，停止字幕生成');
         state.isPlaying = false;
+        state.isVideoPlaying = false;
 
-        // 停止音频捕获
-        stopAudioCapture();
+        // 停止音频捕获（视频暂停时不处理剩余数据）
+        stopAudioCapture(true);
 
         // 停止字幕显示检查器
         stopSubtitleDisplayChecker();
 
         // 隐藏字幕
         hideSubtitle();
+
+        // 如果字幕已启用，更新按钮状态并显示提示
+        if (state.isEnabled) {
+            updateButtonText();
+            showUserNotification('视频已暂停，字幕功能已暂停', 'info');
+        }
     }
 
     // 初始化字幕系统
@@ -798,6 +1341,8 @@
         if (!state.videoElement.paused && !state.videoElement.ended) {
             logger.info('视频已在播放中，直接启动字幕生成');
             handleVideoPlay();
+        } else {
+            logger.info('视频当前暂停，等待用户播放视频');
         }
 
         logger.info('字幕系统初始化完成');
@@ -813,6 +1358,9 @@
         // 停止音频捕获
         stopAudioCapture();
 
+        // 隐藏用户通知
+        hideUserNotification();
+
         // 清空音频队列和累积器
         state.audioQueue = [];
         state.audioAccumulator = [];
@@ -826,6 +1374,12 @@
         if (state.processingTimeout) {
             clearTimeout(state.processingTimeout);
             state.processingTimeout = null;
+        }
+
+        // 清理队列清理定时器
+        if (state.queueCleanupTimeout) {
+            clearTimeout(state.queueCleanupTimeout);
+            state.queueCleanupTimeout = null;
         }
 
         // 清理字幕隐藏定时器
@@ -1046,9 +1600,29 @@
         return panel;
     }
 
+    // 更新按钮文本
+    function updateButtonText() {
+        const button = document.getElementById('subtitle-control-button');
+        if (!button) return;
+
+        if (!state.isEnabled) {
+            button.textContent = '开启字幕';
+            button.style.background = '#1890ff';
+        } else {
+            if (state.isVideoPlaying) {
+                button.textContent = '关闭字幕';
+                button.style.background = '#ff4d4f';
+            } else {
+                button.textContent = '视频暂停';
+                button.style.background = '#faad14'; // 黄色表示暂停状态
+            }
+        }
+    }
+
     // 创建控制按钮
     function createControlButton() {
         const button = document.createElement('button');
+        button.id = 'subtitle-control-button';
         button.textContent = '开启字幕';
         button.style.cssText = `
             position: fixed;
@@ -1084,7 +1658,6 @@
             color: #666;
         `;
 
-        let isEnabled = false;
         let settingsPanel = null;
         let settingsVisible = false;
 
@@ -1112,11 +1685,10 @@
 
         // 主按钮点击事件
         button.addEventListener('click', () => {
-            isEnabled = !isEnabled;
+            state.isEnabled = !state.isEnabled;
 
-            if (isEnabled) {
-                button.textContent = '关闭字幕';
-                button.style.background = '#ff4d4f';
+            if (state.isEnabled) {
+                updateButtonText();
                 initSubtitleSystem();
 
                 // 显示设置面板
@@ -1131,8 +1703,7 @@
                 settingsButton.style.borderColor = '#1890ff';
                 settingsButton.style.color = '#1890ff';
             } else {
-                button.textContent = '开启字幕';
-                button.style.background = '#1890ff';
+                updateButtonText();
                 cleanup();
 
                 // 隐藏字幕
@@ -1160,6 +1731,20 @@
                 state.delayMultiplier = 1;
             }
         });
+
+        // 添加视频状态监听，实时更新按钮
+        const checkVideoState = () => {
+            if (state.videoElement && state.isEnabled) {
+                const isCurrentlyPlaying = !state.videoElement.paused && !state.videoElement.ended;
+                if (isCurrentlyPlaying !== state.isVideoPlaying) {
+                    state.isVideoPlaying = isCurrentlyPlaying;
+                    updateButtonText();
+                }
+            }
+        };
+
+        // 每500ms检查一次视频状态
+        setInterval(checkVideoState, 500);
 
         document.body.appendChild(settingsButton);
         document.body.appendChild(button);
