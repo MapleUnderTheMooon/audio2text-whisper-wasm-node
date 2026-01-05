@@ -21,7 +21,9 @@
         BUFFER_SIZE: 4096, // ScriptProcessor 缓冲区大小 (约250ms@16kHz)
         ACCUMULATE_DURATION: 3, // 累积3秒音频后发送，平衡精度和延迟
         CACHE_DURATION: 60000, // 字幕缓存时长：60秒
-        DELAY_MULTIPLIER: 1 // 延迟倍数，1表示完全抵消延迟，可调节
+        DELAY_MULTIPLIER: 1, // 延迟倍数，1表示完全抵消延迟，可调节
+        SUBTITLE_BASE_DURATION: 5000, // 字幕基础显示时间（毫秒）
+        SUBTITLE_CHAR_DURATION: 300 // 每个字符额外显示时间（毫秒）
     };
 
     // 核心状态管理
@@ -42,7 +44,16 @@
         displayCheckInterval: null, // 字幕显示检查定时器
         lastProcessedTime: 0, // 上次处理时间
         isPlaying: false, // 视频播放状态
-        delayMultiplier: 1 // 当前延迟倍数
+        delayMultiplier: 1, // 当前延迟倍数
+        subtitleBaseDuration: 5000, // 字幕基础显示时间
+        subtitleCharDuration: 300, // 每个字符额外显示时间
+        audioQueue: [], // 音频数据队列
+        maxQueueSize: 10, // 最大队列长度
+        processingTimeout: null, // 处理超时定时器
+        subtitleHideTimeout: null, // 字幕隐藏超时定时器
+        lastSubtitleText: '', // 上次显示的字幕文本
+        lastSubtitleTime: 0, // 上次显示字幕的时间
+        isSameSubtitle: false // 是否是相同的字幕
     };
 
     // 日志工具
@@ -164,6 +175,53 @@
         return new Blob([buffer], { type: 'audio/wav' });
     }
 
+    // 获取自适应累积时长
+    function getAdaptiveAccumulateDuration() {
+        // 根据队列长度动态调整累积时长
+        const baseDuration = CONFIG.ACCUMULATE_DURATION;
+        const queueFactor = Math.min(state.audioQueue.length * 0.5, 2); // 最多增加2秒
+        return baseDuration + queueFactor;
+    }
+
+    // 将音频加入处理队列
+    function queueAudioForProcessing() {
+        // 将当前累积的音频数据加入队列
+        const audioData = {
+            data: [...state.audioAccumulator], // 深拷贝
+            segmentStartTime: state.segmentStartTime,
+            timestamp: Date.now()
+        };
+
+        // 如果队列未满，加入队列
+        if (state.audioQueue.length < state.maxQueueSize) {
+            state.audioQueue.push(audioData);
+            logger.debug(`音频已加入队列，队列长度: ${state.audioQueue.length}`);
+        } else {
+            logger.warn('队列已满，丢弃最早的音频数据');
+            // 使用先进先出策略，丢弃最旧的数据
+            state.audioQueue.shift();
+            state.audioQueue.push(audioData);
+        }
+
+        // 清空当前累积缓冲区
+        state.audioAccumulator = [];
+        state.accumulatorSize = 0;
+        state.segmentStartTime = null;
+
+        // 如果没有正在处理的任务，立即处理队列中的音频
+        if (!state.isProcessing) {
+            processQueuedAudio();
+        }
+    }
+
+    // 处理队列中的下一个音频
+    function processNextAudio() {
+        // 使用 setTimeout(0) 实现非阻塞处理
+        setTimeout(() => {
+            processQueuedAudio();
+        }, 0);
+    }
+
     // 累积音频数据
     function accumulateAudioData(float32Array) {
         // 如果是新的累积周期，记录开始时间
@@ -181,18 +239,110 @@
         state.audioAccumulator.push(int16Array);
         state.accumulatorSize += int16Array.length;
 
-        // 计算累积的音频时长
+        // 使用自适应累积时长
+        const adaptiveDuration = getAdaptiveAccumulateDuration();
         const accumulatedDuration = state.accumulatorSize / CONFIG.SAMPLE_RATE;
-        logger.debug(`累积进度: ${state.accumulatorSize} 样本 = ${accumulatedDuration.toFixed(2)}秒 / ${CONFIG.ACCUMULATE_DURATION}秒`);
+        logger.debug(`累积进度: ${accumulatedDuration.toFixed(2)}秒 / ${adaptiveDuration.toFixed(2)}秒 (队列长度: ${state.audioQueue.length})`);
 
-        // 达到目标时长后发送
-        if (accumulatedDuration >= CONFIG.ACCUMULATE_DURATION) {
-            logger.info('✅ 达到累积时长，准备发送到后端');
-            processRealTimeAudio();
+        // 达到目标时长后加入队列
+        if (accumulatedDuration >= adaptiveDuration) {
+            logger.info('✅ 达到自适应累积时长，加入处理队列');
+            queueAudioForProcessing();
         }
     }
 
-    // 处理实时音频数据
+    // 异步处理队列中的音频
+    async function processQueuedAudio() {
+        if (state.isProcessing || state.audioQueue.length === 0) {
+            return;
+        }
+
+        state.isProcessing = true;
+
+        // 设置处理超时（5秒）
+        state.processingTimeout = setTimeout(() => {
+            logger.warn('音频处理超时，强制结束');
+            state.isProcessing = false;
+            processNextAudio();
+        }, 5000);
+
+        try {
+            // 从队列取出音频数据
+            const audioTask = state.audioQueue.shift();
+            const segmentEndTime = state.videoElement.currentTime;
+
+            logger.debug('开始处理队列中的音频');
+
+            // 合并音频数据
+            const totalLength = audioTask.data.reduce((sum, arr) => sum + arr.length, 0);
+            const mergedArray = new Int16Array(totalLength);
+            let offset = 0;
+
+            for (const arr of audioTask.data) {
+                mergedArray.set(arr, offset);
+                offset += arr.length;
+            }
+
+            // 编码为 WAV 格式
+            const wavBlob = encodeWAV(mergedArray, CONFIG.SAMPLE_RATE);
+
+            logger.debug('发送 WAV 音频，大小:', wavBlob.size, '字节');
+
+            // 发送到后端
+            const result = await sendToBackend(wavBlob);
+
+            if (result && result.success) {
+                let text = result.text || result.data?.text || '';
+
+                // 验证和处理后端返回的文本，处理null时间戳问题
+                if (text) {
+                    // 清理重复的单字符文本（如"小小小"）
+                    const cleanedText = text.replace(/(.)\1{2,}/g, '$1');
+
+                    // 如果文本被清理了，记录警告
+                    if (cleanedText !== text) {
+                        logger.warn('检测到重复字符，已清理:', `原始: "${text}" -> 清理后: "${cleanedText}"`);
+                    }
+
+                    // 使用清理后的文本
+                    text = cleanedText;
+
+                    logger.info('识别到文本:', text);
+
+                    // 保存字幕到队列
+                    const subtitle = {
+                        text,
+                        startTime: audioTask.segmentStartTime,
+                        endTime: segmentEndTime
+                    };
+                    state.subtitleQueue.push(subtitle);
+                    logger.debug('字幕已加入队列:', subtitle);
+
+                    // 兼容旧的缓存方式
+                    saveSubtitleToCache({ text, timestamp: Date.now() });
+                } else {
+                    logger.warn('后端返回空文本，可能存在时间戳问题');
+                }
+            }
+
+        } catch (error) {
+            logger.error('处理队列音频失败:', error);
+        } finally {
+            // 清理超时定时器
+            if (state.processingTimeout) {
+                clearTimeout(state.processingTimeout);
+                state.processingTimeout = null;
+            }
+
+            state.isProcessing = false;
+            logger.debug('音频处理完成，处理下一个队列项');
+
+            // 处理队列中的下一个音频
+            processNextAudio();
+        }
+    }
+
+    // 处理实时音频数据（保留向后兼容）
     async function processRealTimeAudio() {
         if (state.audioAccumulator.length === 0 || state.isProcessing) {
             if (state.isProcessing) {
@@ -226,7 +376,20 @@
 
             if (result && result.success) {
                 let text = result.text || result.data?.text || '';
+
+                // 验证和处理后端返回的文本，处理null时间戳问题
                 if (text) {
+                    // 清理重复的单字符文本（如"小小小"）
+                    const cleanedText = text.replace(/(.)\1{2,}/g, '$1');
+
+                    // 如果文本被清理了，记录警告
+                    if (cleanedText !== text) {
+                        logger.warn('检测到重复字符，已清理:', `原始: "${text}" -> 清理后: "${cleanedText}"`);
+                    }
+
+                    // 使用清理后的文本
+                    text = cleanedText;
+
                     logger.info('识别到文本:', text);
                     // 保存字幕和对应的时间范围
                     const subtitle = {
@@ -239,6 +402,8 @@
 
                     // 兼容旧的缓存方式
                     saveSubtitleToCache({ text, timestamp: Date.now() });
+                } else {
+                    logger.warn('后端返回空文本，可能存在时间戳问题');
                 }
             }
 
@@ -277,7 +442,22 @@
                 throw new Error(`HTTP错误! 状态: ${response.status}, 详情: ${errorText}`);
             }
 
-            return await response.json();
+            const result = await response.json();
+
+            // 检查响应中的时间戳问题
+            if (result.chunks) {
+                for (const chunkId in result.chunks) {
+                    const chunk = result.chunks[chunkId];
+                    if (chunk.timestamp) {
+                        // 检查时间戳是否为null
+                        if (chunk.timestamp[1] === null) {
+                            logger.warn('检测到null时间戳，可能导致处理延迟:', chunk);
+                        }
+                    }
+                }
+            }
+
+            return result;
 
         } catch (error) {
             logger.error('发送到后端失败:', error);
@@ -309,11 +489,39 @@
             return;
         }
 
+        // 清除之前的隐藏定时器
+        if (state.subtitleHideTimeout) {
+            clearTimeout(state.subtitleHideTimeout);
+            state.subtitleHideTimeout = null;
+        }
+
+        // 如果是相同的字幕，不重置显示时间
+        if (state.lastSubtitleText === text) {
+            state.isSameSubtitle = true;
+            logger.debug('相同字幕，保持显示');
+            return;
+        }
+
+        // 新字幕，更新显示内容
+        state.lastSubtitleText = text;
+        state.isSameSubtitle = false;
         state.subtitleElement.textContent = text;
         state.subtitleElement.style.opacity = '1';
         state.containerElement.style.opacity = '1';
+        state.lastSubtitleTime = Date.now();
 
-        logger.debug('显示字幕:', text);
+        // 设置字幕显示时间：文本越长，显示时间越长
+        const baseTime = state.subtitleBaseDuration;
+        const textLength = text.length;
+        const extraTime = textLength * state.subtitleCharDuration;
+        const displayTime = Math.min(baseTime + extraTime, 15000); // 最多显示15秒
+
+        logger.debug(`字幕显示时间: ${displayTime}ms (文本长度: ${textLength})`);
+
+        // 设置自动隐藏定时器
+        state.subtitleHideTimeout = setTimeout(() => {
+            hideSubtitle();
+        }, displayTime);
     }
 
     // 隐藏字幕
@@ -321,6 +529,17 @@
         if (state.subtitleElement && state.subtitleElement.style.opacity !== '0') {
             state.subtitleElement.style.opacity = '0';
             state.containerElement.style.opacity = '0';
+
+            // 清除隐藏定时器
+            if (state.subtitleHideTimeout) {
+                clearTimeout(state.subtitleHideTimeout);
+                state.subtitleHideTimeout = null;
+            }
+
+            // 清理状态
+            state.lastSubtitleText = '';
+            state.isSameSubtitle = false;
+
             logger.debug('隐藏字幕');
         }
     }
@@ -351,9 +570,15 @@
             );
 
             if (currentSubtitle) {
-                showSubtitle(currentSubtitle.text);
+                // 只有在新字幕或当前字幕已隐藏时才调用showSubtitle
+                if (!state.isSameSubtitle || state.subtitleElement.style.opacity === '0') {
+                    showSubtitle(currentSubtitle.text);
+                }
             } else {
-                hideSubtitle();
+                // 如果没有匹配的字幕且当前有字幕显示，则隐藏
+                if (state.subtitleElement && state.subtitleElement.style.opacity !== '0') {
+                    hideSubtitle();
+                }
             }
 
             // 清理过期的字幕（保留最近20秒的字幕）
@@ -476,6 +701,30 @@
     function stopAudioCapture() {
         state.isRecording = false;
 
+        // 处理剩余的队列数据
+        if (state.audioQueue.length > 0) {
+            logger.info(`停止捕获时，队列中还有 ${state.audioQueue.length} 个音频段待处理`);
+
+            // 处理剩余的音频数据
+            while (state.audioQueue.length > 0) {
+                setTimeout(() => {
+                    processQueuedAudio();
+                }, 0);
+            }
+        }
+
+        // 处理当前累积的音频数据
+        if (state.audioAccumulator.length > 0) {
+            logger.info('停止捕获时，还有未处理的累积音频，加入队列');
+            queueAudioForProcessing();
+        }
+
+        // 清理超时定时器
+        if (state.processingTimeout) {
+            clearTimeout(state.processingTimeout);
+            state.processingTimeout = null;
+        }
+
         if (state.scriptProcessor) {
             state.scriptProcessor.disconnect();
             state.scriptProcessor = null;
@@ -564,8 +813,31 @@
         // 停止音频捕获
         stopAudioCapture();
 
+        // 清空音频队列和累积器
+        state.audioQueue = [];
+        state.audioAccumulator = [];
+        state.accumulatorSize = 0;
+        state.segmentStartTime = null;
+
         // 清空字幕队列
         state.subtitleQueue = [];
+
+        // 清理超时定时器
+        if (state.processingTimeout) {
+            clearTimeout(state.processingTimeout);
+            state.processingTimeout = null;
+        }
+
+        // 清理字幕隐藏定时器
+        if (state.subtitleHideTimeout) {
+            clearTimeout(state.subtitleHideTimeout);
+            state.subtitleHideTimeout = null;
+        }
+
+        // 重置字幕状态
+        state.lastSubtitleText = '';
+        state.isSameSubtitle = false;
+        state.lastSubtitleTime = 0;
 
         // 移除视频事件监听
         if (state.videoElement) {
@@ -576,57 +848,73 @@
         logger.info('资源清理完成');
     }
 
-    // 创建延迟倍数调节控件
-    function createDelaySlider() {
+    // 创建字幕显示时间调节面板
+    function createSubtitleDurationPanel() {
         // 检查是否已存在
-        if (document.getElementById('delay-slider-container')) {
-            return document.getElementById('delay-slider-container');
+        if (document.getElementById('subtitle-duration-panel')) {
+            return document.getElementById('subtitle-duration-panel');
         }
 
-        const container = document.createElement('div');
-        container.id = 'delay-slider-container';
-        container.style.cssText = `
+        const panel = document.createElement('div');
+        panel.id = 'subtitle-duration-panel';
+        panel.style.cssText = `
             position: fixed;
             top: 80px;
             right: 20px;
             z-index: 99999;
             background: rgba(255, 255, 255, 0.95);
-            padding: 15px 20px;
+            padding: 20px;
             border-radius: 12px;
             box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            min-width: 200px;
+            min-width: 250px;
             backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
         `;
 
-        const label = document.createElement('div');
-        label.textContent = '字幕延迟调节';
-        label.style.cssText = `
-            font-size: 14px;
+        const title = document.createElement('div');
+        title.textContent = '字幕显示时间设置';
+        title.style.cssText = `
+            font-size: 16px;
             font-weight: bold;
             color: #333;
+            margin-bottom: 15px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+        `;
+
+        // 基础显示时间调节
+        const baseDurationContainer = document.createElement('div');
+        baseDurationContainer.style.cssText = `
+            margin-bottom: 15px;
+        `;
+
+        const baseDurationLabel = document.createElement('div');
+        baseDurationLabel.textContent = '基础显示时间';
+        baseDurationLabel.style.cssText = `
+            font-size: 13px;
+            color: #555;
             margin-bottom: 5px;
         `;
 
-        const valueDisplay = document.createElement('div');
-        valueDisplay.id = 'delay-value-display';
-        valueDisplay.textContent = '当前倍数: 1.00x';
-        valueDisplay.style.cssText = `
-            font-size: 12px;
-            color: #666;
+        const baseDurationValue = document.createElement('div');
+        baseDurationValue.id = 'base-duration-value';
+        baseDurationValue.textContent = `${state.subtitleBaseDuration / 1000} 秒`;
+        baseDurationValue.style.cssText = `
+            font-size: 11px;
+            color: #777;
             margin-bottom: 8px;
+            text-align: right;
         `;
 
-        const slider = document.createElement('input');
-        slider.type = 'range';
-        slider.id = 'delay-multiplier-slider';
-        slider.min = '0.5';
-        slider.max = '2.0';
-        slider.step = '0.05';
-        slider.value = '1.0';
-        slider.style.cssText = `
+        const baseDurationSlider = document.createElement('input');
+        baseDurationSlider.type = 'range';
+        baseDurationSlider.id = 'base-duration-slider';
+        baseDurationSlider.min = '2000';
+        baseDurationSlider.max = '10000';
+        baseDurationSlider.step = '500';
+        baseDurationSlider.value = state.subtitleBaseDuration;
+        baseDurationSlider.style.cssText = `
             width: 100%;
             height: 6px;
             border-radius: 3px;
@@ -635,30 +923,127 @@
             cursor: pointer;
         `;
 
-        const infoText = document.createElement('div');
-        infoText.textContent = '数值越小，字幕越超前';
-        infoText.style.cssText = `
+        // 每个字符额外时间调节
+        const charDurationContainer = document.createElement('div');
+        charDurationContainer.style.cssText = `
+            margin-bottom: 15px;
+        `;
+
+        const charDurationLabel = document.createElement('div');
+        charDurationLabel.textContent = '字符额外时间';
+        charDurationLabel.style.cssText = `
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 5px;
+        `;
+
+        const charDurationValue = document.createElement('div');
+        charDurationValue.id = 'char-duration-value';
+        charDurationValue.textContent = `${state.subtitleCharDuration} 毫秒/字符`;
+        charDurationValue.style.cssText = `
+            font-size: 11px;
+            color: #777;
+            margin-bottom: 8px;
+            text-align: right;
+        `;
+
+        const charDurationSlider = document.createElement('input');
+        charDurationSlider.type = 'range';
+        charDurationSlider.id = 'char-duration-slider';
+        charDurationSlider.min = '100';
+        charDurationSlider.max = '1000';
+        charDurationSlider.step = '50';
+        charDurationSlider.value = state.subtitleCharDuration;
+        charDurationSlider.style.cssText = `
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: #ddd;
+            outline: none;
+            cursor: pointer;
+        `;
+
+        // 预览区域
+        const previewContainer = document.createElement('div');
+        previewContainer.style.cssText = `
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.05);
+            border-radius: 8px;
+        `;
+
+        const previewLabel = document.createElement('div');
+        previewLabel.textContent = '示例预览';
+        previewLabel.style.cssText = `
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 8px;
+        `;
+
+        const previewText = document.createElement('div');
+        previewText.textContent = '这是字幕文本示例';
+        previewText.style.cssText = `
+            font-size: 14px;
+            color: #333;
+            text-align: center;
+        `;
+
+        const previewDuration = document.createElement('div');
+        previewDuration.id = 'preview-duration';
+        previewDuration.style.cssText = `
             font-size: 11px;
             color: #999;
             text-align: center;
             margin-top: 5px;
         `;
 
-        slider.addEventListener('input', (e) => {
-            const value = parseFloat(e.target.value);
-            state.delayMultiplier = value;
-            valueDisplay.textContent = `当前倍数: ${value.toFixed(2)}x`;
-            logger.debug('延迟倍数已更新:', value);
+        // 更新预览
+        function updatePreview() {
+            const text = '这是字幕文本示例';
+            const displayTime = Math.min(
+                state.subtitleBaseDuration + text.length * state.subtitleCharDuration,
+                15000
+            );
+            previewDuration.textContent = `预计显示时间: ${(displayTime / 1000).toFixed(1)}秒`;
+        }
+
+        // 事件监听器
+        baseDurationSlider.addEventListener('input', (e) => {
+            state.subtitleBaseDuration = parseInt(e.target.value);
+            baseDurationValue.textContent = `${state.subtitleBaseDuration / 1000} 秒`;
+            updatePreview();
         });
 
-        container.appendChild(label);
-        container.appendChild(valueDisplay);
-        container.appendChild(slider);
-        container.appendChild(infoText);
+        charDurationSlider.addEventListener('input', (e) => {
+            state.subtitleCharDuration = parseInt(e.target.value);
+            charDurationValue.textContent = `${state.subtitleCharDuration} 毫秒/字符`;
+            updatePreview();
+        });
 
-        document.body.appendChild(container);
+        // 组装面板
+        baseDurationContainer.appendChild(baseDurationLabel);
+        baseDurationContainer.appendChild(baseDurationValue);
+        baseDurationContainer.appendChild(baseDurationSlider);
 
-        return container;
+        charDurationContainer.appendChild(charDurationLabel);
+        charDurationContainer.appendChild(charDurationValue);
+        charDurationContainer.appendChild(charDurationSlider);
+
+        previewContainer.appendChild(previewLabel);
+        previewContainer.appendChild(previewText);
+        previewContainer.appendChild(previewDuration);
+
+        panel.appendChild(title);
+        panel.appendChild(baseDurationContainer);
+        panel.appendChild(charDurationContainer);
+        panel.appendChild(previewContainer);
+
+        document.body.appendChild(panel);
+
+        // 初始化预览
+        updatePreview();
+
+        return panel;
     }
 
     // 创建控制按钮
@@ -682,9 +1067,50 @@
             transition: all 0.3s ease;
         `;
 
-        let isEnabled = false;
-        let sliderContainer = null;
+        const settingsButton = document.createElement('button');
+        settingsButton.textContent = '⚙️';
+        settingsButton.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 160px;
+            z-index: 99999;
+            padding: 8px 12px;
+            font-size: 18px;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            color: #666;
+        `;
 
+        let isEnabled = false;
+        let settingsPanel = null;
+        let settingsVisible = false;
+
+        // 设置按钮点击事件
+        settingsButton.addEventListener('click', () => {
+            settingsVisible = !settingsVisible;
+
+            if (settingsVisible) {
+                if (!settingsPanel) {
+                    settingsPanel = createSubtitleDurationPanel();
+                }
+                settingsPanel.style.display = 'block';
+                settingsButton.style.background = 'rgba(255, 255, 255, 0.95)';
+                settingsButton.style.borderColor = '#1890ff';
+                settingsButton.style.color = '#1890ff';
+            } else {
+                if (settingsPanel) {
+                    settingsPanel.style.display = 'none';
+                }
+                settingsButton.style.background = 'rgba(255, 255, 255, 0.9)';
+                settingsButton.style.borderColor = '#ddd';
+                settingsButton.style.color = '#666';
+            }
+        });
+
+        // 主按钮点击事件
         button.addEventListener('click', () => {
             isEnabled = !isEnabled;
 
@@ -692,8 +1118,18 @@
                 button.textContent = '关闭字幕';
                 button.style.background = '#ff4d4f';
                 initSubtitleSystem();
-                // 显示延迟调节滑块
-                sliderContainer = createDelaySlider();
+
+                // 显示设置面板
+                if (!settingsPanel) {
+                    settingsPanel = createSubtitleDurationPanel();
+                }
+                settingsPanel.style.display = 'block';
+                settingsVisible = true;
+
+                // 更新设置按钮状态
+                settingsButton.style.background = 'rgba(255, 255, 255, 0.95)';
+                settingsButton.style.borderColor = '#1890ff';
+                settingsButton.style.color = '#1890ff';
             } else {
                 button.textContent = '开启字幕';
                 button.style.background = '#1890ff';
@@ -709,17 +1145,23 @@
                     state.containerElement.style.opacity = '0';
                 }
 
-                // 移除延迟调节滑块
-                if (sliderContainer) {
-                    sliderContainer.remove();
-                    sliderContainer = null;
+                // 隐藏设置面板
+                if (settingsPanel) {
+                    settingsPanel.style.display = 'none';
                 }
+                settingsVisible = false;
+
+                // 重置设置按钮状态
+                settingsButton.style.background = 'rgba(255, 255, 255, 0.9)';
+                settingsButton.style.borderColor = '#ddd';
+                settingsButton.style.color = '#666';
 
                 // 重置延迟倍数
                 state.delayMultiplier = 1;
             }
         });
 
+        document.body.appendChild(settingsButton);
         document.body.appendChild(button);
     }
 

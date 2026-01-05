@@ -799,13 +799,13 @@ export async function audioToText(audioPath, options = {}) {
         // 格式化结果
         const result = {
             text: traditionalToSimplified(output.text),
-            chunks: output.chunks || [],
+            chunks: sanitizeTimestamps(output.chunks || []),
             language: output.language || config.language,
             duration: output.duration || 0,
             task: config.subtask,
             model: modelName,
             timestamp: new Date().toISOString(),
-            confidence: calculateConfidence(output.chunks || [])
+            confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
         };
         
         // 调试：查看 result.text
@@ -1023,13 +1023,13 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         // 格式化结果
         const result = {
             text: traditionalToSimplified(output.text),
-            chunks: output.chunks || [],
+            chunks: sanitizeTimestamps(output.chunks || []),
             language: output.language || config.language,
             duration: output.duration || 0,
             task: config.subtask,
             model: modelName,
             timestamp: new Date().toISOString(),
-            confidence: calculateConfidence(output.chunks || [])
+            confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
         };
         
         // 调试：查看 result.text
@@ -1167,15 +1167,52 @@ function validateTranscription(result) {
     if (!result) {
         return false;
     }
-    
+
     // 检查是否有文本输出
     const hasText = result.text && result.text.trim().length > 0;
     if (!hasText) {
         return false;
     }
-    
+
     // 放宽验证标准：只检查是否有文本，不检查置信度和长度
     return true;
+}
+
+// 清理和验证时间戳数据
+export function sanitizeTimestamps(chunks) {
+    if (!chunks || !Array.isArray(chunks)) return [];
+
+    return chunks.map(chunk => {
+        if (!chunk) return chunk;
+
+        // 创建一个新chunk对象以避免修改原始对象
+        const sanitizedChunk = { ...chunk };
+
+        // 处理时间戳转换
+        if (chunk.timestamp) {
+            if (Array.isArray(chunk.timestamp)) {
+                // 已经是数组格式，只需要处理null值
+                sanitizedChunk.timestamp = chunk.timestamp.map(ts =>
+                    ts === null ? 0 : ts
+                );
+            } else if (typeof chunk.timestamp === 'object') {
+                // 处理对象格式 {0: start, 1: end}
+                const start = chunk.timestamp[0] || 0;
+                const end = chunk.timestamp[1] !== null ? chunk.timestamp[1] :
+                           (chunk.timestamp.end || start + 1); // 回退到 start + 1
+                sanitizedChunk.timestamp = [start, end];
+            } else {
+                // 时间戳格式异常，使用默认值
+                console.warn('⚠️  时间戳格式异常，使用默认值:', chunk.timestamp);
+                sanitizedChunk.timestamp = [0, 1];
+            }
+        } else {
+            // 没有时间戳数据
+            sanitizedChunk.timestamp = [0, 1];
+        }
+
+        return sanitizedChunk;
+    });
 }
 
 // 带有重试机制的转录函数
