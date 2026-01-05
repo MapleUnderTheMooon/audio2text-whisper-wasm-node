@@ -135,21 +135,31 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
         // 记录开始时间
         const startTime = Date.now();
 
-        // 直接从内存缓冲区处理音频数据
-        const result = await audioFromBuffer(req.file.buffer, {
-            ...options,
-            filename: req.file.originalname,
-            mimetype: req.file.mimetype,
-            progress_callback: (data) => {
-                if (data.status === 'initiate') {
-                    console.log(`📥 正在下载: ${data.file}`);
-                } else if (data.status === 'progress') {
-                    console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
-                } else if (data.status === 'done') {
-                    console.log(`✅ 下载完成: ${data.file}`);
-                }
-            }
+        // 设置超时控制
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => {
+                reject(new Error('TIMEOUT'));
+            }, 2000); // 2秒超时
         });
+
+        // 直接从内存缓冲区处理音频数据，使用 Promise.race 实现超时
+        const result = await Promise.race([
+            audioFromBuffer(req.file.buffer, {
+                ...options,
+                filename: req.file.originalname,
+                mimetype: req.file.mimetype,
+                progress_callback: (data) => {
+                    if (data.status === 'initiate') {
+                        console.log(`📥 正在下载: ${data.file}`);
+                    } else if (data.status === 'progress') {
+                        console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
+                    } else if (data.status === 'done') {
+                        console.log(`✅ 下载完成: ${data.file}`);
+                    }
+                }
+            }),
+            timeoutPromise
+        ]);
 
         // 计算处理时间
         const processingTime = Date.now() - startTime;
@@ -176,6 +186,17 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
     } catch (error) {
         console.error('❌ 转录错误:', error);
 
+        // 处理超时错误
+        if (error.message === 'TIMEOUT') {
+            return res.status(408).json({
+                success: false,
+                error: '转录超时',
+                message: '处理时间超过2秒，已丢弃',
+                code: 'TIMEOUT'
+            });
+        }
+
+        // 其他错误正常处理
         res.status(500).json({
             success: false,
             error: error.message,
@@ -219,7 +240,14 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
         // 记录开始时间
         const startTime = Date.now();
 
-        // 直接从内存缓冲区批量处理音频数据
+        // 设置超时控制
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => {
+                reject(new Error('TIMEOUT'));
+            }, 2000); // 2秒超时
+        });
+
+        // 直接从内存缓冲区批量处理音频数据，使用 Promise.race 实现超时
         // 将文件缓冲区与选项提取出来以匹配 batchAudioFromBuffers 的参数格式
         const audioBuffers = req.files.map(file => file.buffer);
         const fileOptions = req.files.map(file => ({
@@ -230,8 +258,11 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
             quantized: options.quantized,
             progress_callback: options.progress_callback
         }));
-        
-        const results = await batchAudioFromBuffers(audioBuffers, fileOptions);
+
+        const results = await Promise.race([
+            batchAudioFromBuffers(audioBuffers, fileOptions),
+            timeoutPromise
+        ]);
 
         // 计算处理时间
         const processingTime = Date.now() - startTime;
@@ -263,6 +294,17 @@ app.post('/api/batch-transcribe', upload.array('audio', 10), async (req, res) =>
     } catch (error) {
         console.error('❌ 批量转录错误:', error);
 
+        // 处理超时错误
+        if (error.message === 'TIMEOUT') {
+            return res.status(408).json({
+                success: false,
+                error: '批量转录超时',
+                message: '处理时间超过2秒，已丢弃',
+                code: 'TIMEOUT'
+            });
+        }
+
+        // 其他错误正常处理
         res.status(500).json({
             success: false,
             error: error.message,
