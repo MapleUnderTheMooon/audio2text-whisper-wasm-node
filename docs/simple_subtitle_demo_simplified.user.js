@@ -1517,6 +1517,46 @@
             cursor: pointer;
         `;
 
+        // 延迟倍数调节
+        const delayMultiplierContainer = document.createElement('div');
+        delayMultiplierContainer.style.cssText = `
+            margin-bottom: 15px;
+        `;
+
+        const delayMultiplierLabel = document.createElement('div');
+        delayMultiplierLabel.textContent = '延迟倍数（倍速）';
+        delayMultiplierLabel.style.cssText = `
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 5px;
+        `;
+
+        const delayMultiplierValue = document.createElement('div');
+        delayMultiplierValue.id = 'delay-multiplier-value';
+        delayMultiplierValue.textContent = `${state.delayMultiplier}x`;
+        delayMultiplierValue.style.cssText = `
+            font-size: 11px;
+            color: #777;
+            margin-bottom: 8px;
+            text-align: right;
+        `;
+
+        const delayMultiplierSlider = document.createElement('input');
+        delayMultiplierSlider.type = 'range';
+        delayMultiplierSlider.id = 'delay-multiplier-slider';
+        delayMultiplierSlider.min = '0.5';
+        delayMultiplierSlider.max = '2';
+        delayMultiplierSlider.step = '0.1';
+        delayMultiplierSlider.value = state.delayMultiplier;
+        delayMultiplierSlider.style.cssText = `
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: #ddd;
+            outline: none;
+            cursor: pointer;
+        `;
+
         // 预览区域
         const previewContainer = document.createElement('div');
         previewContainer.style.cssText = `
@@ -1558,7 +1598,7 @@
                 state.subtitleBaseDuration + text.length * state.subtitleCharDuration,
                 15000
             );
-            previewDuration.textContent = `预计显示时间: ${(displayTime / 1000).toFixed(1)}秒`;
+            previewDuration.textContent = `预计显示时间: ${(displayTime / 1000).toFixed(1)}秒 (延迟: ${state.delayMultiplier}x)`;
         }
 
         // 事件监听器
@@ -1574,6 +1614,12 @@
             updatePreview();
         });
 
+        delayMultiplierSlider.addEventListener('input', (e) => {
+            state.delayMultiplier = parseFloat(e.target.value);
+            delayMultiplierValue.textContent = `${state.delayMultiplier}x`;
+            updatePreview();
+        });
+
         // 组装面板
         baseDurationContainer.appendChild(baseDurationLabel);
         baseDurationContainer.appendChild(baseDurationValue);
@@ -1583,6 +1629,10 @@
         charDurationContainer.appendChild(charDurationValue);
         charDurationContainer.appendChild(charDurationSlider);
 
+        delayMultiplierContainer.appendChild(delayMultiplierLabel);
+        delayMultiplierContainer.appendChild(delayMultiplierValue);
+        delayMultiplierContainer.appendChild(delayMultiplierSlider);
+
         previewContainer.appendChild(previewLabel);
         previewContainer.appendChild(previewText);
         previewContainer.appendChild(previewDuration);
@@ -1590,6 +1640,7 @@
         panel.appendChild(title);
         panel.appendChild(baseDurationContainer);
         panel.appendChild(charDurationContainer);
+        panel.appendChild(delayMultiplierContainer);
         panel.appendChild(previewContainer);
 
         document.body.appendChild(panel);
