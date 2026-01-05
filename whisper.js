@@ -505,6 +505,117 @@ console.log('⚡ 已启用 WASM SIMD 支持');
 env.wasmMemoryLimit = 1024; // 设置 WASM 内存限制为 1024 MB
 console.log('📊 WASM 内存限制设置为:', env.wasmMemoryLimit + 'MB');
 
+// 尝试启用 WebGPU 支持
+async function initWebGPU() {
+    // 检查是否在浏览器环境
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
+        console.log('⚠️  不在浏览器环境或 WebGPU 不可用，使用 CPU 模式');
+        return false;
+    }
+
+    try {
+        // 请求 WebGPU 适配器
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            console.log('⚠️  WebGPU 不可用，使用 CPU 模式');
+            return false;
+        }
+
+        // 获取设备信息
+        const device = await adapter.requestDevice();
+
+        // 打印 GPU 信息
+        const adapterInfo = adapter.info;
+        console.log('🎮 GPU 加速已启用!');
+        console.log(`📊 GPU 设备: ${adapterInfo.device || 'Unknown'}`);
+        console.log(`🏢 GPU 厂商: ${adapterInfo.vendor || 'Unknown'}`);
+        console.log(`💾 GPU 内存: ${adapterInfo?.limits?.maxTextureDimension2D ? '可用' : '未知'}`);
+
+        // 配置 WebGPU 后端
+        env.backends = {
+            onnx: {
+                wasm: {
+                    numThreads: 2,  // 保持 2 线程平衡性能和内存
+                    simd: true,     // 已启用 SIMD
+                    webgpu: true    // 启用 WebGPU
+                }
+            }
+        };
+
+        console.log('✅ WebGPU 后端配置完成');
+        return true;
+    } catch (error) {
+        console.log(`⚠️  WebGPU 初始化失败: ${error.message}，使用 CPU 模式`);
+        return false;
+    }
+}
+
+// 获取详细的系统信息
+async function getSystemInfo() {
+    const info = {
+        platform: typeof navigator !== 'undefined' ? navigator.platform : 'Node.js',
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'Node.js',
+        hardwareConcurrency: typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : null,
+        memory: typeof navigator !== 'undefined' ? (navigator.deviceMemory || '未知') : '未知',
+        webGPU: false,
+        gpuInfo: null
+    };
+
+    // 检测 WebGPU 支持
+    if (typeof navigator !== 'undefined' && navigator.gpu) {
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (adapter) {
+                info.webGPU = true;
+                info.gpuInfo = {
+                    device: adapter.info.device || 'Unknown',
+                    vendor: adapter.info.vendor || 'Unknown',
+                    canTimestampQueries: adapter.features.has('timestamp-query'),
+                    canFloat32Filtering: adapter.features.has('float32-filtering'),
+                    limits: adapter.info?.limits || {}
+                };
+            }
+        } catch (e) {
+            info.webGPU = false;
+        }
+    }
+
+    return info;
+}
+
+// 打印系统信息
+async function printSystemInfo() {
+    const systemInfo = await getSystemInfo();
+
+    console.log('\n🖥️  系统信息:');
+    console.log(`   平台: ${systemInfo.platform}`);
+    console.log(`   CPU 核心: ${systemInfo.hardwareConcurrency || '未知'}`);
+    console.log(`   内存: ${systemInfo.memory}`);
+    console.log(`   浏览器: ${systemInfo.userAgent.split(' ').slice(0, 2).join(' ')}`);
+
+    if (systemInfo.webGPU) {
+        console.log('\n🎮 GPU 信息:');
+        console.log(`   设备: ${systemInfo.gpuInfo.device}`);
+        console.log(`   厂商: ${systemInfo.gpuInfo.vendor}`);
+        console.log(`   时间戳查询: ${systemInfo.gpuInfo.canTimestampQueries ? '支持' : '不支持'}`);
+        console.log(`   浮点过滤: ${systemInfo.gpuInfo.canFloat32Filtering ? '支持' : '不支持'}`);
+    } else {
+        console.log('\n⚠️  WebGPU 不可用，将使用 CPU 模式');
+    }
+    console.log('');
+}
+
+// 检测并初始化 WebGPU
+printSystemInfo().then(() => {
+    initWebGPU().then(hasGPU => {
+        if (hasGPU) {
+            console.log('🚀 系统已准备就绪，将使用 GPU 加速进行推理');
+        } else {
+            console.log('📱 将使用 CPU 模式进行推理');
+        }
+    });
+});
+
 // 设置模型目录优先级：先查找项目models目录，再查找默认缓存
 const defaultCacheDir = path.join(__dirname, 'node_modules', '@xenova', 'transformers', '.cache', 'Xenova', 'whisper-tiny');
 const projectModelsDir = path.join(__dirname, 'models');
@@ -551,6 +662,9 @@ class WhisperPipelineFactory {
     static model = null;
     static quantized = null;
     static instance = null;
+    static isGPUEnabled = false;
+    static modelLoadTime = 0;
+    static inferenceTimes = [];
 
     constructor(tokenizer, model, quantized) {
         this.tokenizer = tokenizer;
@@ -560,23 +674,67 @@ class WhisperPipelineFactory {
 
     static async getInstance(progressCallback = null) {
         if (this.instance === null) {
+            const startTime = Date.now();
+
             console.log('🧠 正在加载 Whisper 模型...');
             console.log('📦 模型名称:', this.model);
             console.log('🔢 量化选项:', this.quantized);
-            
+            console.log('🎮 处理器类型:', this.isGPUEnabled ? 'GPU' : 'CPU');
+
+            // 检测并更新 GPU 状态
+            try {
+                const { env } = await import('@xenova/transformers');
+                if (env.backends?.onnx?.wasm?.webgpu) {
+                    this.isGPUEnabled = true;
+                    console.log('✅ 已启用 GPU 推理优化');
+                }
+            } catch (e) {
+                this.isGPUEnabled = false;
+            }
+
             this.instance = await pipeline(this.task, this.model, {
                 quantized: this.quantized,
                 progress_callback: progressCallback,
-                
+
                 // 关键修复：明确指定模型类型为 whisper，避免系统错误选择 CTC 架构
                 model_type: 'whisper',
-                
+
                 // 对于中等模型，需要加载 no_attentions 版本以避免内存不足
-                revision: this.model.includes('/whisper-medium') ? 'no_attentions' : 'main'
+                revision: this.model.includes('/whisper-medium') ? 'no_attentions' : 'main',
+
+                // 优化：根据处理器类型调整配置
+                ...this.getOptimizedConfig()
             });
-            console.log('✅ Whisper 模型加载完成');
+
+            this.modelLoadTime = Date.now() - startTime;
+            console.log(`✅ Whisper 模型加载完成（耗时: ${(this.modelLoadTime / 1000).toFixed(2)}s）`);
         }
         return this.instance;
+    }
+
+    // 获取优化配置
+    static getOptimizedConfig() {
+        const baseConfig = {};
+
+        if (this.isGPUEnabled) {
+            // GPU 优化配置
+            console.log('🔧 应用 GPU 优化配置');
+            baseConfig.num_threads = 1;  // GPU 通常不需要多线程
+        } else {
+            // CPU 优化配置
+            console.log('🔧 应用 CPU 优化配置');
+            // 在 Node.js 环境中使用 os 模块获取 CPU 核心数
+            try {
+                const os = require('os');
+                const cpuCount = os.cpus().length;
+                baseConfig.num_threads = Math.min(cpuCount, 4);
+            } catch {
+                // 如果 require 失败，使用默认值
+                baseConfig.num_threads = 4;
+            }
+        }
+
+        return baseConfig;
     }
 
     static async dispose() {
@@ -584,18 +742,50 @@ class WhisperPipelineFactory {
             try {
                 await this.instance.dispose();
                 console.log('🗑️  模型实例已释放');
+
+                // 输出性能统计
+                this.printPerformanceStats();
             } catch (error) {
                 console.error('❌ 释放模型实例失败:', error.message);
             } finally {
                 this.instance = null;
                 this.model = null;
                 this.quantized = null;
+                this.inferenceTimes = [];
+
                 // 触发垃圾回收
                 if (global.gc) {
                     global.gc();
                     console.log('🧹 已触发垃圾回收');
                 }
             }
+        }
+    }
+
+    // 记录推理时间
+    static recordInferenceTime(inferenceTime) {
+        this.inferenceTimes.push(inferenceTime);
+        // 只保留最近 10 次推理时间
+        if (this.inferenceTimes.length > 10) {
+            this.inferenceTimes.shift();
+        }
+    }
+
+    // 打印性能统计
+    static printPerformanceStats() {
+        if (this.inferenceTimes.length > 0) {
+            const avgTime = this.inferenceTimes.reduce((a, b) => a + b, 0) / this.inferenceTimes.length;
+            const minTime = Math.min(...this.inferenceTimes);
+            const maxTime = Math.max(...this.inferenceTimes);
+
+            console.log('\n📊 性能统计报告:');
+            console.log(`   加载时间: ${(this.modelLoadTime / 1000).toFixed(2)}s`);
+            console.log(`   平均推理时间: ${(avgTime / 1000).toFixed(3)}s`);
+            console.log(`   最快推理时间: ${(minTime / 1000).toFixed(3)}s`);
+            console.log(`   最慢推理时间: ${(maxTime / 1000).toFixed(3)}s`);
+            console.log(`   处理器类型: ${this.isGPUEnabled ? 'GPU' : 'CPU'}`);
+            console.log(`   量子化: ${this.quantized ? '是' : '否'}`);
+            console.log('');
         }
     }
 }
@@ -1219,17 +1409,18 @@ export function sanitizeTimestamps(chunks) {
 async function transcribeWithRetry(transcriber, audioData, config, maxRetries = 2) {
     let attempt = 0;
     let result = null;
-    
+    const inferenceStartTime = Date.now();
+
     // 复制原始配置，避免修改原始对象
     const originalConfig = { ...config };
-    
+
     while (attempt <= maxRetries && !result) {
         try {
             console.log(`📝 转录尝试 ${attempt + 1}/${maxRetries + 1}`);
-            
+
             // 每次尝试使用新的配置对象
             const attemptConfig = { ...originalConfig };
-            
+
             // 根据尝试次数调整参数
             if (attempt > 0) {
                 console.log(`🔧 调整解码参数，尝试第 ${attempt + 1} 次`);
@@ -1238,14 +1429,25 @@ async function transcribeWithRetry(transcriber, audioData, config, maxRetries = 
                 attemptConfig.beam_size = 5;
                 attemptConfig.patience = 1.0;
             }
-            
+
             // 执行转录
             result = await transcriber(audioData, attemptConfig);
-            
+
+            // 计算推理时间
+            const inferenceTime = Date.now() - inferenceStartTime;
+
             // 验证转录结果（放宽验证标准）
             if (result && result.text && result.text.trim().length > 0) {
                 const confidence = result.confidence || calculateConfidence(result.chunks || []);
                 console.log(`✅ 转录尝试 ${attempt + 1} 成功，置信度: ${confidence.toFixed(3)}`);
+
+                // 记录推理时间到工厂类
+                WhisperPipelineFactory.recordInferenceTime(inferenceTime);
+
+                // 打印推理性能信息
+                const processorType = WhisperPipelineFactory.isGPUEnabled ? 'GPU' : 'CPU';
+                console.log(`⚡ 推理完成 - 耗时: ${(inferenceTime / 1000).toFixed(3)}s (${processorType})`);
+
                 return result;
             } else {
                 console.log(`⚠️  转录尝试 ${attempt + 1} 结果质量不高，尝试调整参数重试...`);
@@ -1253,18 +1455,20 @@ async function transcribeWithRetry(transcriber, audioData, config, maxRetries = 
                 result = null;
             }
         } catch (error) {
+            const inferenceTime = Date.now() - inferenceStartTime;
             console.error(`❌ 转录尝试 ${attempt + 1} 失败:`, error.message);
-            
+            console.error(`   推理时间: ${(inferenceTime / 1000).toFixed(3)}s`);
+
             // 如果是参数冲突错误，直接返回当前结果
             if (error.message.includes('Cannot specify')) {
                 console.log(`⚠️  参数冲突，直接返回当前结果`);
                 return result;
             }
         }
-        
+
         attempt++;
     }
-    
+
     return result;
 }
 
