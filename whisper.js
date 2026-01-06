@@ -874,15 +874,23 @@ export async function audioToText(audioPath, options = {}) {
         console.log('🔧 正在读取音频文件...');
         const audioData = await decodeAudioFile(audioPath);
         
+        // 计算音频时长
+        const duration = audioData.length / 16000; // Whisper 内部使用 16kHz
+        console.log(`🕐 音频时长: ${duration.toFixed(2)}s`);
+
+        // 判断是否为短音频
+        const isShort = duration < 8;
+        console.log(`📊 音频类型: ${isShort ? '短音频' : '长音频'}`);
+
         // 计算时间精度
-        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length / 
+        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length /
                              transcriber.model.config.max_source_positions;
-        
+
         console.log('🎤 正在进行语音识别...');
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
-        
-                // 评估音频质量
+
+        // 评估音频质量
         const audioQuality = evaluateAudioQuality(audioData);
         console.log('📊 音频质量评估:', {
             rms: audioQuality.rms.toFixed(6),
@@ -895,28 +903,35 @@ export async function audioToText(audioPath, options = {}) {
         // 执行转录 - 确保传入正确的音频格式
         let output;
         
-        // 构建转录配置
+        // 构建转录配置 - 基于音频长度和质量进行优化
         const transcribeConfig = {
             // 根据音频质量调整解码策略
             top_k: audioQuality.isLowQuality ? 5 : 0,
             top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
-            temperature: audioQuality.isLowQuality ? 0.1 : 0.0,
-            beam_size: audioQuality.isLowQuality ? 5 : 1,
-            patience: audioQuality.isLowQuality ? 1.5 : 1.0,
+
+            // 根据音频长度调整温度和beam size
+            temperature: isShort ? 0.0 : 0.0,  // 短音频也用0温度，提高边界检测精度
+            beam_size: isShort ? 5 : 5,         // 短音频用更大的beam
+
+            top_k: 40,
+            top_p: 0.9,
+
+            patience: isShort ? 0.5 : 1.0,     // 短音频减少耐心值，加快响应
             length_penalty: 1.0,
-            
-            // 滑动窗口
-            chunk_length_s: isDistilWhisper ? 20 : 30,
-            stride_length_s: isDistilWhisper ? 3 : 5,
-            
+
+            // 总是返回时间戳，便于边界检测
+            return_timestamps: true,
+
+            // 滑动窗口设置
+            chunk_length_s: isShort ? 8 : (isDistilWhisper ? 20 : 30),  // 短音频使用更小的分块
+            stride_length_s: isShort ? 2 : (isDistilWhisper ? 3 : 5),    // 短音频使用更小的步长
+
             // 语言和任务
             language: config.language,
             task: config.subtask,
-            
-            // 返回时间戳
-            return_timestamps: true,
+
             force_full_sequences: false,
-            
+
             // 进度回调
             callback_function: (item) => {
                 const lastChunk = item[0];
@@ -924,11 +939,15 @@ export async function audioToText(audioPath, options = {}) {
                     console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
                 }
             },
-            
-            // 其他优化
+
+            // 其他优化参数
             compression_ratio_threshold: 2.4,
             logprob_threshold: -1.0,
-            no_speech_threshold: 0.6
+            no_speech_threshold: isShort ? 0.1 : 0.3,  // 短音频更严格的无语音阈值
+
+            // 静音检测相关
+            detect_speech: true,
+            min_silence_duration: 0.5
         };
         
         try {
@@ -1106,15 +1125,23 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         // 解码音频缓冲区
         console.log('🔧 正在解码音频数据...');
         const audioData = await decodeAudioBuffer(audioBuffer, ext, mimetype);
-        
+
+        // 计算音频时长
+        const duration = audioData.length / 16000; // Whisper 内部使用 16kHz
+        console.log(`🕐 音频时长: ${duration.toFixed(2)}s`);
+
+        // 判断是否为短音频
+        const isShort = duration < 8;
+        console.log(`📊 音频类型: ${isShort ? '短音频' : '长音频'}`);
+
         // 计算时间精度
-        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length / 
+        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length /
                              transcriber.model.config.max_source_positions;
-        
+
         console.log('🎤 正在进行语音识别...');
         console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
         console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
-        
+
         // 评估音频质量
         const audioQuality = evaluateAudioQuality(audioData);
         console.log('📊 音频质量评估:', {
@@ -1128,31 +1155,43 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         // 执行转录 - 确保传入正确的音频格式
         let output;
         
-        // 优化：根据音频质量调整解码参数
+        // 优化：根据音频长度和质量调整解码参数
         const transcribeConfig = {
             // 根据音频质量调整解码策略
             top_k: audioQuality.isLowQuality ? 5 : 0,
             top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
-            temperature: audioQuality.isLowQuality ? 0.1 : 0.0,
-            beam_size: audioQuality.isLowQuality ? 5 : 1,
-            patience: audioQuality.isLowQuality ? 1.5 : 1.0,
+
+            // 根据音频长度调整温度和beam size
+            temperature: isShort ? 0.0 : 0.0,  // 短音频也用0温度，提高边界检测精度
+            beam_size: isShort ? 5 : 5,         // 短音频用更大的beam
+
+            top_k: 40,
+            top_p: 0.9,
+
+            patience: isShort ? 0.5 : 1.0,     // 短音频减少耐心值，加快响应
             length_penalty: 1.0,
-            
-            // 滑动窗口
-            chunk_length_s: isDistilWhisper ? 20 : 30,
-            stride_length_s: isDistilWhisper ? 3 : 5,
-            
+
+            // 总是返回时间戳，便于边界检测
+            return_timestamps: true,
+
+            // 滑动窗口设置
+            chunk_length_s: isShort ? 8 : (isDistilWhisper ? 20 : 30),  // 短音频使用更小的分块
+            stride_length_s: isShort ? 2 : (isDistilWhisper ? 3 : 5),    // 短音频使用更小的步长
+
             // 语言和任务
             language: config.language,
             task: config.subtask,
-            
-            // 返回时间戳
-            return_timestamps: true,
-            
-            // 其他优化
+
+            force_full_sequences: false,
+
+            // 其他优化参数
             compression_ratio_threshold: 2.4,
             logprob_threshold: -1.0,
-            no_speech_threshold: 0.6
+            no_speech_threshold: isShort ? 0.1 : 0.3,  // 短音频更严格的无语音阈值
+
+            // 静音检测相关
+            detect_speech: true,
+            min_silence_duration: 0.5
         };
         
         try {
