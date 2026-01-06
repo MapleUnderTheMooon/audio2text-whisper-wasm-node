@@ -790,6 +790,176 @@ class WhisperPipelineFactory {
     }
 }
 
+// 统一的配置和模型管理函数
+function prepareConfigAndModel(options) {
+    // 设置默认选项
+    const defaultOptions = {
+        model: 'Xenova/whisper-tiny',
+        quantized: false,
+        multilingual: true,
+        subtask: 'transcribe',
+        language: 'zh', // 中文
+        progress_callback: (data) => {
+            if (data.status === 'initiate') {
+                console.log(`📥 正在下载: ${data.file}`);
+            } else if (data.status === 'progress') {
+                console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
+            } else if (data.status === 'done') {
+                console.log(`✅ 下载完成: ${data.file}`);
+            }
+        }
+    };
+
+    const config = { ...defaultOptions, ...options };
+
+    // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
+    let modelName = config.model;
+
+    // 如果是简写模型名称，添加完整前缀
+    const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
+    if (modelShortNames.includes(modelName)) {
+        modelName = `Xenova/whisper-${modelName}`;
+    }
+
+    // 检查是否是 Distil Whisper 模型
+    const isDistilWhisper = modelName.startsWith('distil-whisper/');
+
+    if (!isDistilWhisper && !config.multilingual) {
+        modelName += '.en';
+    }
+
+    // 管理模型实例
+    const factory = WhisperPipelineFactory;
+    if (factory.model !== modelName || factory.quantized !== config.quantized) {
+        // 如果模型不同，释放之前的实例
+        if (factory.instance !== null) {
+            factory.dispose();
+        }
+        factory.model = modelName;
+        factory.quantized = config.quantized;
+    }
+
+    console.log('🎯 正在加载语音识别模型:', modelName);
+    console.log('📊 配置:', {
+        quantized: config.quantized,
+        multilingual: config.multilingual,
+        language: config.language,
+        subtask: config.subtask
+    });
+
+    return { config, modelName, isDistilWhisper };
+}
+
+// 统一的音频处理函数（公共逻辑）
+async function processAudio(audioData, config, modelName, isDistilWhisper, audioQuality, duration) {
+    // 计算音频长度类型
+    const isShort = duration < 8;
+
+    // 构建转录配置 - 基于音频长度和质量进行优化
+    const transcribeConfig = {
+        // 根据音频质量调整解码策略
+        top_k: audioQuality.isLowQuality ? 5 : 0,
+        top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
+
+        // 根据音频长度调整温度和beam size
+        temperature: isShort ? 0.0 : 0.0,  // 短音频也用0温度，提高边界检测精度
+        beam_size: isShort ? 5 : 5,         // 短音频用更大的beam
+
+        top_k: 40,
+        top_p: 0.9,
+
+        patience: isShort ? 0.5 : 1.0,     // 短音频减少耐心值，加快响应
+        length_penalty: 1.0,
+
+        // 总是返回时间戳，便于边界检测
+        return_timestamps: true,
+
+        // 滑动窗口设置
+        chunk_length_s: isShort ? 8 : (isDistilWhisper ? 20 : 30),  // 短音频使用更小的分块
+        stride_length_s: isShort ? 2 : (isDistilWhisper ? 3 : 5),    // 短音频使用更小的步长
+
+        // 语言和任务
+        language: config.language,
+        task: config.subtask,
+        force_full_sequences: false,
+
+        // 其他优化参数
+        compression_ratio_threshold: 2.4,
+        logprob_threshold: -1.0,
+        no_speech_threshold: isShort ? 0.1 : 0.3,  // 短音频更严格的无语音阈值
+
+        // 静音检测相关
+        detect_speech: true,
+        min_silence_duration: 0.5
+    };
+
+    // 加载转录模型
+    const factory = WhisperPipelineFactory;
+    const transcriber = await factory.getInstance(config.progress_callback);
+
+    // 准备转录输入
+    let transcriptionInput = audioData;
+    if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
+        console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
+    } else if (audioData instanceof Buffer) {
+        console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
+        transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
+    } else if (audioData instanceof ArrayBuffer) {
+        console.log('🎯 音频数据为 ArrayBuffer，直接传递');
+    } else {
+        console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
+    }
+
+    // 使用带有重试机制的转录函数
+    const output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
+
+    if (!output) {
+        throw new Error('所有转录尝试均失败，结果质量不满足要求');
+    }
+
+    // 调试：查看 output 对象结构
+    console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
+        if (typeof value === 'object' && value !== null) {
+            const limited = {};
+            for (const k of Object.keys(value).slice(0, 10)) {
+                limited[k] = value[k];
+            }
+            if (Object.keys(value).length > 10) {
+                limited['...'] = `${Object.keys(value).length - 10} more keys`;
+            }
+            return limited;
+        }
+        return value;
+    }, 2));
+
+    // 调试：查看 output.text
+    console.log('🔍 调试：output.text:', typeof output.text, output.text);
+    console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
+
+    // 格式化结果
+    const result = {
+        text: traditionalToSimplified(output.text),
+        chunks: sanitizeTimestamps(output.chunks || []),
+        language: output.language || config.language,
+        duration: output.duration || 0,
+        task: config.subtask,
+        model: modelName,
+        timestamp: new Date().toISOString(),
+        confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
+    };
+
+    // 调试：查看 result.text
+    console.log('🔍 调试：result.text:', typeof result.text, result.text);
+    console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
+
+    // 如果检测到繁体字，转换为简体并记录
+    if (output.text !== result.text) {
+        console.log('🔄 检测到繁体字，已转换为简体中文');
+    }
+
+    return result;
+}
+
 // 音频转文本核心功能
 export async function audioToText(audioPath, options = {}) {
     try {
@@ -812,83 +982,16 @@ export async function audioToText(audioPath, options = {}) {
             console.log(`⚠️  警告: 文件格式 ${ext} 可能不被支持，建议使用: ${supportedFormats.join(', ')}`);
         }
         
-        // 设置默认选项
-        const defaultOptions = {
-            model: 'Xenova/whisper-tiny',
-            quantized: false,
-            multilingual: true,
-            subtask: 'transcribe',
-            language: 'zh', // 中文
-            progress_callback: (data) => {
-                if (data.status === 'initiate') {
-                    console.log(`📥 正在下载: ${data.file}`);
-                } else if (data.status === 'progress') {
-                    console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
-                } else if (data.status === 'done') {
-                    console.log(`✅ 下载完成: ${data.file}`);
-                }
-            }
-        };
-        
-        const config = { ...defaultOptions, ...options };
-        
-        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
-        let modelName = config.model;
-        
-        // 如果是简写模型名称，添加完整前缀
-        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
-        if (modelShortNames.includes(modelName)) {
-            modelName = `Xenova/whisper-${modelName}`;
-        }
-        
-        // 检查是否是 Distil Whisper 模型
-        const isDistilWhisper = modelName.startsWith('distil-whisper/');
-        
-        if (!isDistilWhisper && !config.multilingual) {
-            modelName += '.en';
-        }
-        
-        // 管理模型实例
-        const factory = WhisperPipelineFactory;
-        if (factory.model !== modelName || factory.quantized !== config.quantized) {
-            // 如果模型不同，释放之前的实例
-            if (factory.instance !== null) {
-                await factory.dispose();
-            }
-            factory.model = modelName;
-            factory.quantized = config.quantized;
-        }
-        
-        console.log('🎯 正在加载语音识别模型:', modelName);
-        console.log('📊 配置:', {
-            quantized: config.quantized,
-            multilingual: config.multilingual,
-            language: config.language,
-            subtask: config.subtask
-        });
-        
-        // 加载转录模型
-        const transcriber = await factory.getInstance(config.progress_callback);
-        
+        // 使用统一的配置和模型管理函数
+        const { config, modelName, isDistilWhisper } = prepareConfigAndModel(options);
+
         // 读取和解码音频文件
         console.log('🔧 正在读取音频文件...');
         const audioData = await decodeAudioFile(audioPath);
-        
+
         // 计算音频时长
         const duration = audioData.length / 16000; // Whisper 内部使用 16kHz
         console.log(`🕐 音频时长: ${duration.toFixed(2)}s`);
-
-        // 判断是否为短音频
-        const isShort = duration < 8;
-        console.log(`📊 音频类型: ${isShort ? '短音频' : '长音频'}`);
-
-        // 计算时间精度
-        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length /
-                             transcriber.model.config.max_source_positions;
-
-        console.log('🎤 正在进行语音识别...');
-        console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
-        console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
 
         // 评估音频质量
         const audioQuality = evaluateAudioQuality(audioData);
@@ -899,132 +1002,9 @@ export async function audioToText(audioPath, options = {}) {
             isLowQuality: audioQuality.isLowQuality,
             isLowPeak: audioQuality.isLowPeak
         });
-        
-        // 执行转录 - 确保传入正确的音频格式
-        let output;
-        
-        // 构建转录配置 - 基于音频长度和质量进行优化
-        const transcribeConfig = {
-            // 根据音频质量调整解码策略
-            top_k: audioQuality.isLowQuality ? 5 : 0,
-            top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
 
-            // 根据音频长度调整温度和beam size
-            temperature: isShort ? 0.0 : 0.0,  // 短音频也用0温度，提高边界检测精度
-            beam_size: isShort ? 5 : 5,         // 短音频用更大的beam
-
-            top_k: 40,
-            top_p: 0.9,
-
-            patience: isShort ? 0.5 : 1.0,     // 短音频减少耐心值，加快响应
-            length_penalty: 1.0,
-
-            // 总是返回时间戳，便于边界检测
-            return_timestamps: true,
-
-            // 滑动窗口设置
-            chunk_length_s: isShort ? 8 : (isDistilWhisper ? 20 : 30),  // 短音频使用更小的分块
-            stride_length_s: isShort ? 2 : (isDistilWhisper ? 3 : 5),    // 短音频使用更小的步长
-
-            // 语言和任务
-            language: config.language,
-            task: config.subtask,
-
-            force_full_sequences: false,
-
-            // 进度回调
-            callback_function: (item) => {
-                const lastChunk = item[0];
-                if (lastChunk && lastChunk.output_token_ids) {
-                    console.log(`🎵 处理进度: ${(lastChunk.output_token_ids.length / 5000 * 100).toFixed(1)}%`);
-                }
-            },
-
-            // 其他优化参数
-            compression_ratio_threshold: 2.4,
-            logprob_threshold: -1.0,
-            no_speech_threshold: isShort ? 0.1 : 0.3,  // 短音频更严格的无语音阈值
-
-            // 静音检测相关
-            detect_speech: true,
-            min_silence_duration: 0.5
-        };
-        
-        try {
-            let transcriptionInput = audioData;
-            
-            // 转换为合适的格式
-            if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
-                // 如果已经是 Float32Array 或 Float64Array，直接使用
-                console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
-            } else if (audioData instanceof Buffer) {
-                // 如果是 Buffer，将其转换为 ArrayBuffer 后使用
-                console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
-                transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
-            } else if (audioData instanceof ArrayBuffer) {
-                // 如果是 ArrayBuffer，直接使用
-                console.log('🎯 音频数据为 ArrayBuffer，直接传递');
-            } else {
-                // 其他情况，直接使用
-                console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
-            }
-            
-            // 使用带有重试机制的转录函数
-            output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
-            
-            // 如果重试后仍然没有结果，抛出错误
-            if (!output) {
-                throw new Error('所有转录尝试均失败，结果质量不满足要求');
-            }
-        } catch (transcribeError) {
-            console.error('❌ 转录过程出错:', transcribeError.message);
-            console.error('❌ 转录错误堆栈:', transcribeError.stack);
-            throw transcribeError;
-        }
-        
-        console.log('✅ 语音识别完成！');
-        
-        // 调试：查看 output 对象结构
-        console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
-            if (typeof value === 'object' && value !== null) {
-                const limited = {};
-                for (const k of Object.keys(value).slice(0, 10)) {
-                    limited[k] = value[k];
-                }
-                if (Object.keys(value).length > 10) {
-                    limited['...'] = `${Object.keys(value).length - 10} more keys`;
-                }
-                return limited;
-            }
-            return value;
-        }, 2));
-        
-        // 调试：查看 output.text
-        console.log('🔍 调试：output.text:', typeof output.text, output.text);
-        
-        // 调试：查看 output.text 长度
-        console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
-        
-        // 格式化结果
-        const result = {
-            text: traditionalToSimplified(output.text),
-            chunks: sanitizeTimestamps(output.chunks || []),
-            language: output.language || config.language,
-            duration: output.duration || 0,
-            task: config.subtask,
-            model: modelName,
-            timestamp: new Date().toISOString(),
-            confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
-        };
-        
-        // 调试：查看 result.text
-        console.log('🔍 调试：result.text:', typeof result.text, result.text);
-        console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
-        
-        // 如果检测到繁体字，转换为简体并记录
-        if (output.text !== result.text) {
-            console.log('🔄 检测到繁体字，已转换为简体中文');
-        }
+        // 使用统一的音频处理函数
+        const result = await processAudio(audioData, config, modelName, isDistilWhisper, audioQuality, duration);
         
         // 注意：不需要手动设置 audioData 和 output 为 null
         // JavaScript 垃圾回收器会自动处理不再引用的变量
@@ -1052,75 +1032,20 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         if (!audioBuffer) {
             throw new Error('没有提供音频数据');
         }
-        
+
         console.log('🚀 开始处理内存中的音频数据');
         console.log(`📁 数据大小: ${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB`);
-        
+
         // 获取文件信息（如果有）
         const filename = options.filename || '内存中的音频';
         const mimetype = options.mimetype || 'application/octet-stream';
         const ext = options.ext || path.extname(filename).toLowerCase();
-        
+
         console.log(`📄 原始文件名: ${filename}`);
         console.log(`🎭 MIME类型: ${mimetype}`);
-        
-        // 设置默认选项
-        const defaultOptions = {
-            model: 'Xenova/whisper-tiny',
-            quantized: false,
-            multilingual: true,
-            subtask: 'transcribe',
-            language: 'zh', // 中文
-            progress_callback: (data) => {
-                if (data.status === 'initiate') {
-                    console.log(`📥 正在下载: ${data.file}`);
-                } else if (data.status === 'progress') {
-                    console.log(`⏳ 下载进度: ${data.file} - ${data.progress.toFixed(1)}%`);
-                } else if (data.status === 'done') {
-                    console.log(`✅ 下载完成: ${data.file}`);
-                }
-            }
-        };
-        
-        const config = { ...defaultOptions, ...options };
-        
-        // 处理模型名称，支持简写（如 base → Xenova/whisper-base）
-        let modelName = config.model;
-        
-        // 如果是简写模型名称，添加完整前缀
-        const modelShortNames = ['tiny', 'base', 'small', 'medium', 'large'];
-        if (modelShortNames.includes(modelName)) {
-            modelName = `Xenova/whisper-${modelName}`;
-        }
-        
-        // 检查是否是 Distil Whisper 模型
-        const isDistilWhisper = modelName.startsWith('distil-whisper/');
-        
-        if (!isDistilWhisper && !config.multilingual) {
-            modelName += '.en';
-        }
-        
-        // 管理模型实例
-        const factory = WhisperPipelineFactory;
-        if (factory.model !== modelName || factory.quantized !== config.quantized) {
-            // 如果模型不同，释放之前的实例
-            if (factory.instance !== null) {
-                await factory.dispose();
-            }
-            factory.model = modelName;
-            factory.quantized = config.quantized;
-        }
-        
-        console.log('🎯 正在加载语音识别模型:', modelName);
-        console.log('📊 配置:', {
-            quantized: config.quantized,
-            multilingual: config.multilingual,
-            language: config.language,
-            subtask: config.subtask
-        });
-        
-        // 加载转录模型
-        const transcriber = await factory.getInstance(config.progress_callback);
+
+        // 使用统一的配置和模型管理函数
+        const { config, modelName, isDistilWhisper } = prepareConfigAndModel(options);
         
         // 解码音频缓冲区
         console.log('🔧 正在解码音频数据...');
@@ -1129,18 +1054,6 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
         // 计算音频时长
         const duration = audioData.length / 16000; // Whisper 内部使用 16kHz
         console.log(`🕐 音频时长: ${duration.toFixed(2)}s`);
-
-        // 判断是否为短音频
-        const isShort = duration < 8;
-        console.log(`📊 音频类型: ${isShort ? '短音频' : '长音频'}`);
-
-        // 计算时间精度
-        const timePrecision = transcriber.processor.feature_extractor.config.chunk_length /
-                             transcriber.model.config.max_source_positions;
-
-        console.log('🎤 正在进行语音识别...');
-        console.log(`📏 分块长度: ${isDistilWhisper ? 20 : 30}s`);
-        console.log(`📐 步长: ${isDistilWhisper ? 3 : 5}s`);
 
         // 评估音频质量
         const audioQuality = evaluateAudioQuality(audioData);
@@ -1151,124 +1064,9 @@ export async function audioFromBuffer(audioBuffer, options = {}) {
             isLowQuality: audioQuality.isLowQuality,
             isLowPeak: audioQuality.isLowPeak
         });
-        
-        // 执行转录 - 确保传入正确的音频格式
-        let output;
-        
-        // 优化：根据音频长度和质量调整解码参数
-        const transcribeConfig = {
-            // 根据音频质量调整解码策略
-            top_k: audioQuality.isLowQuality ? 5 : 0,
-            top_p: audioQuality.isLowQuality ? 0.9 : 1.0,
 
-            // 根据音频长度调整温度和beam size
-            temperature: isShort ? 0.0 : 0.0,  // 短音频也用0温度，提高边界检测精度
-            beam_size: isShort ? 5 : 5,         // 短音频用更大的beam
-
-            top_k: 40,
-            top_p: 0.9,
-
-            patience: isShort ? 0.5 : 1.0,     // 短音频减少耐心值，加快响应
-            length_penalty: 1.0,
-
-            // 总是返回时间戳，便于边界检测
-            return_timestamps: true,
-
-            // 滑动窗口设置
-            chunk_length_s: isShort ? 8 : (isDistilWhisper ? 20 : 30),  // 短音频使用更小的分块
-            stride_length_s: isShort ? 2 : (isDistilWhisper ? 3 : 5),    // 短音频使用更小的步长
-
-            // 语言和任务
-            language: config.language,
-            task: config.subtask,
-
-            force_full_sequences: false,
-
-            // 其他优化参数
-            compression_ratio_threshold: 2.4,
-            logprob_threshold: -1.0,
-            no_speech_threshold: isShort ? 0.1 : 0.3,  // 短音频更严格的无语音阈值
-
-            // 静音检测相关
-            detect_speech: true,
-            min_silence_duration: 0.5
-        };
-        
-        try {
-            let transcriptionInput = audioData;
-            
-            // 转换为合适的格式
-            if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
-                // 如果已经是 Float32Array 或 Float64Array，直接使用
-                console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
-            } else if (audioData instanceof Buffer) {
-                // 如果是 Buffer，将其转换为 ArrayBuffer 后使用
-                console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
-                transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
-            } else if (audioData instanceof ArrayBuffer) {
-                // 如果是 ArrayBuffer，直接使用
-                console.log('🎯 音频数据为 ArrayBuffer，直接传递');
-            } else {
-                // 其他情况，直接使用
-                console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
-            }
-            
-            // 使用带有重试机制的转录函数
-            output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
-            
-            // 如果重试后仍然没有结果，抛出错误
-            if (!output) {
-                throw new Error('所有转录尝试均失败，结果质量不满足要求');
-            }
-        } catch (transcribeError) {
-            console.error('❌ 转录过程出错:', transcribeError.message);
-            console.error('❌ 转录错误堆栈:', transcribeError.stack);
-            throw transcribeError;
-        }
-        
-        console.log('✅ 语音识别完成！');
-        
-        // 调试：查看 output 对象结构
-        console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
-            if (typeof value === 'object' && value !== null) {
-                const limited = {};
-                for (const k of Object.keys(value).slice(0, 10)) {
-                    limited[k] = value[k];
-                }
-                if (Object.keys(value).length > 10) {
-                    limited['...'] = `${Object.keys(value).length - 10} more keys`;
-                }
-                return limited;
-            }
-            return value;
-        }, 2));
-        
-        // 调试：查看 output.text
-        console.log('🔍 调试：output.text:', typeof output.text, output.text);
-        
-        // 调试：查看 output.text 长度
-        console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
-        
-        // 格式化结果
-        const result = {
-            text: traditionalToSimplified(output.text),
-            chunks: sanitizeTimestamps(output.chunks || []),
-            language: output.language || config.language,
-            duration: output.duration || 0,
-            task: config.subtask,
-            model: modelName,
-            timestamp: new Date().toISOString(),
-            confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
-        };
-        
-        // 调试：查看 result.text
-        console.log('🔍 调试：result.text:', typeof result.text, result.text);
-        console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
-        
-        // 如果检测到繁体字，转换为简体并记录
-        if (output.text !== result.text) {
-            console.log('🔄 检测到繁体字，已转换为简体中文');
-        }
+        // 使用统一的音频处理函数
+        const result = await processAudio(audioData, config, modelName, isDistilWhisper, audioQuality, duration);
         
         // 注意：不需要手动设置 audioData 和 output 为 null
         // JavaScript 垃圾回收器会自动处理不再引用的变量
