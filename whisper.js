@@ -656,6 +656,150 @@ if (process.env.HF_TIMEOUT) {
     console.log('⏰ 网络超时设置:', env.fetchTimeout + 'ms');
 }
 
+// 默认 Whisper 实例管理器
+class DefaultWhisperManager {
+    static task = 'automatic-speech-recognition';
+    static model = 'Xenova/whisper-tiny';  // 固定使用 tiny 模型
+    static quantized = false;
+    static instance = null;
+    static isBusy = false;
+    static modelLoadTime = 0;
+    static inferenceTimes = [];
+    static isGPUEnabled = false;
+    static instancePromise = null;  // 用于跟踪模型实例的创建过程
+
+    constructor(tokenizer, model, quantized) {
+        this.tokenizer = tokenizer;
+        this.model = model;
+        this.quantized = quantized;
+    }
+
+    static async getInstance(progressCallback = null) {
+        // 如果已经有实例，直接返回
+        if (this.instance !== null) {
+            console.log(`✅ 默认 Whisper tiny 实例已存在，直接返回`);
+            return this.instance;
+        }
+
+        // 如果正在创建实例，等待创建完成
+        if (this.instancePromise !== null) {
+            console.log(`⏳ 正在等待默认 Whisper tiny 实例创建完成`);
+            return this.instancePromise;
+        }
+
+        // 开始创建实例，使用 Promise 来跟踪创建过程
+        console.log(`🧠 开始创建默认 Whisper tiny 模型实例`);
+        this.instancePromise = (async () => {
+            const startTime = Date.now();
+
+            // 检测 GPU 状态
+            try {
+                const { env } = await import('@xenova/transformers');
+                if (env.backends?.onnx?.wasm?.webgpu) {
+                    this.isGPUEnabled = true;
+                    console.log('✅ 已启用 GPU 推理优化');
+                }
+            } catch (e) {
+                this.isGPUEnabled = false;
+            }
+
+            this.instance = await pipeline(this.task, this.model, {
+                quantized: this.quantized,
+                progress_callback: progressCallback,
+                model_type: 'whisper',
+                revision: 'main',
+                ...this.getOptimizedConfig()
+            });
+
+            this.modelLoadTime = Date.now() - startTime;
+            console.log(`✅ 默认 Whisper tiny 模型加载完成（耗时: ${(this.modelLoadTime / 1000).toFixed(2)}s）`);
+            return this.instance;
+        })();
+
+        try {
+            // 等待实例创建完成
+            this.instance = await this.instancePromise;
+            return this.instance;
+        } finally {
+            // 清除 instancePromise，无论创建成功与否
+            this.instancePromise = null;
+        }
+    }
+
+    static setBusy(busy) {
+        this.isBusy = busy;
+        if (busy) {
+            console.log('🔒 默认 Whisper tiny 模型已标记为忙碌');
+        } else {
+            console.log('🔓 默认 Whisper tiny 模型已标记为空闲');
+        }
+    }
+
+    static isBusyStatus() {
+        return this.isBusy;
+    }
+
+    static async dispose() {
+        if (this.instance !== null) {
+            try {
+                await this.instance.dispose();
+                console.log('🗑️  默认 Whisper tiny 模型实例已释放');
+                this.printPerformanceStats();
+            } catch (error) {
+                console.error('❌ 释放默认 Whisper tiny 模型实例失败:', error.message);
+            } finally {
+                this.instance = null;
+                this.inferenceTimes = [];
+
+                if (global.gc) {
+                    global.gc();
+                    console.log('🧹 已触发垃圾回收');
+                }
+            }
+        }
+    }
+
+    static getOptimizedConfig() {
+        const baseConfig = {};
+
+        if (this.isGPUEnabled) {
+            baseConfig.num_threads = 1;
+        } else {
+            try {
+                const os = require('os');
+                const cpuCount = os.cpus().length;
+                baseConfig.num_threads = Math.min(cpuCount, 4);
+            } catch {
+                baseConfig.num_threads = 4;
+            }
+        }
+
+        return baseConfig;
+    }
+
+    static recordInferenceTime(inferenceTime) {
+        this.inferenceTimes.push(inferenceTime);
+        if (this.inferenceTimes.length > 10) {
+            this.inferenceTimes.shift();
+        }
+    }
+
+    static printPerformanceStats() {
+        if (this.inferenceTimes.length > 0) {
+            const avgTime = this.inferenceTimes.reduce((a, b) => a + b, 0) / this.inferenceTimes.length;
+            const minTime = Math.min(...this.inferenceTimes);
+            const maxTime = Math.max(...this.inferenceTimes);
+
+            console.log('\n📊 默认 Tiny 实例性能统计:');
+            console.log(`   加载时间: ${(this.modelLoadTime / 1000).toFixed(2)}s`);
+            console.log(`   平均推理时间: ${(avgTime / 1000).toFixed(3)}s`);
+            console.log(`   最快推理时间: ${(minTime / 1000).toFixed(3)}s`);
+            console.log(`   最慢推理时间: ${(maxTime / 1000).toFixed(3)}s`);
+            console.log('');
+        }
+    }
+}
+
 // 模型工厂类，确保只有一个模型实例
 class WhisperPipelineFactory {
     static task = 'automatic-speech-recognition';
@@ -665,6 +809,8 @@ class WhisperPipelineFactory {
     static isGPUEnabled = false;
     static modelLoadTime = 0;
     static inferenceTimes = [];
+    static busyModels = new Map();  // 跟踪忙碌的模型，存储模型名称到请求计数的映射
+    static instancePromise = null;  // 用于跟踪模型实例的创建过程
 
     constructor(tokenizer, model, quantized) {
         this.tokenizer = tokenizer;
@@ -673,10 +819,23 @@ class WhisperPipelineFactory {
     }
 
     static async getInstance(progressCallback = null) {
-        if (this.instance === null) {
+        // 如果已经有实例，直接返回
+        if (this.instance !== null) {
+            console.log(`✅ 直接返回已存在的模型实例: ${this.model}`);
+            return this.instance;
+        }
+
+        // 如果正在创建实例，等待创建完成
+        if (this.instancePromise !== null) {
+            console.log(`⏳ 正在等待模型实例创建完成: ${this.model}`);
+            return this.instancePromise;
+        }
+
+        // 开始创建实例，使用 Promise 来跟踪创建过程
+        console.log(`🧠 开始创建 Whisper 模型实例: ${this.model}`);
+        this.instancePromise = (async () => {
             const startTime = Date.now();
 
-            console.log('🧠 正在加载 Whisper 模型...');
             console.log('📦 模型名称:', this.model);
             console.log('🔢 量化选项:', this.quantized);
             console.log('🎮 处理器类型:', this.isGPUEnabled ? 'GPU' : 'CPU');
@@ -692,7 +851,7 @@ class WhisperPipelineFactory {
                 this.isGPUEnabled = false;
             }
 
-            this.instance = await pipeline(this.task, this.model, {
+            const instance = await pipeline(this.task, this.model, {
                 quantized: this.quantized,
                 progress_callback: progressCallback,
 
@@ -708,8 +867,54 @@ class WhisperPipelineFactory {
 
             this.modelLoadTime = Date.now() - startTime;
             console.log(`✅ Whisper 模型加载完成（耗时: ${(this.modelLoadTime / 1000).toFixed(2)}s）`);
+            return instance;
+        })();
+
+        try {
+            // 等待实例创建完成
+            this.instance = await this.instancePromise;
+            return this.instance;
+        } finally {
+            // 清除 instancePromise，无论创建成功与否
+            this.instancePromise = null;
         }
-        return this.instance;
+    }
+
+    // 模型状态管理方法
+    static markModelBusy(modelName) {
+        const currentCount = this.busyModels.get(modelName) || 0;
+        this.busyModels.set(modelName, currentCount + 1);
+        console.log(`🔒 模型 ${modelName} 已标记为忙碌，当前请求计数: ${currentCount + 1}`);
+    }
+
+    static markModelFree(modelName) {
+        const currentCount = this.busyModels.get(modelName) || 0;
+        if (currentCount > 1) {
+            this.busyModels.set(modelName, currentCount - 1);
+            console.log(`🔓 模型 ${modelName} 已减少请求计数，当前请求计数: ${currentCount - 1}`);
+        } else {
+            this.busyModels.delete(modelName);
+            console.log(`🔓 模型 ${modelName} 已标记为空闲`);
+        }
+    }
+
+    static isModelBusy(modelName) {
+        const isBusy = this.busyModels.has(modelName);
+        console.log(`🔍 检查模型 ${modelName} 状态，忙碌: ${isBusy}`);
+        return isBusy;
+    }
+
+    static getBusyModels() {
+        const busyModels = Array.from(this.busyModels.entries())
+            .map(([modelName, count]) => `${modelName} (${count})`);
+        console.log(`📋 当前忙碌模型列表: ${busyModels.join(', ')}`);
+        return busyModels;
+    }
+
+    static isAnyModelBusy() {
+        const isAnyBusy = this.busyModels.size > 0;
+        console.log(`🔍 检查是否有忙碌模型，结果: ${isAnyBusy}`);
+        return isAnyBusy;
     }
 
     // 获取优化配置
@@ -895,69 +1100,111 @@ async function processAudio(audioData, config, modelName, isDistilWhisper, audio
 
     // 加载转录模型
     const factory = WhisperPipelineFactory;
-    const transcriber = await factory.getInstance(config.progress_callback);
 
-    // 准备转录输入
-    let transcriptionInput = audioData;
-    if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
-        console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
-    } else if (audioData instanceof Buffer) {
-        console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
-        transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
-    } else if (audioData instanceof ArrayBuffer) {
-        console.log('🎯 音频数据为 ArrayBuffer，直接传递');
-    } else {
-        console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
-    }
+    // 检查请求的模型是否忙碌
+    let useDefaultModel = false;
+    let transcriber = null;
 
-    // 使用带有重试机制的转录函数
-    const output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
+    // 调试：打印当前状态
+    console.log(`🔍 调试：检查模型状态 - 模型: ${modelName}, 忙碌状态: ${factory.isModelBusy(modelName)}`);
+    console.log(`🔍 调试：当前忙碌模型列表: ${factory.getBusyModels().join(', ')}`);
 
-    if (!output) {
-        throw new Error('所有转录尝试均失败，结果质量不满足要求');
-    }
-
-    // 调试：查看 output 对象结构
-    console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
-        if (typeof value === 'object' && value !== null) {
-            const limited = {};
-            for (const k of Object.keys(value).slice(0, 10)) {
-                limited[k] = value[k];
-            }
-            if (Object.keys(value).length > 10) {
-                limited['...'] = `${Object.keys(value).length - 10} more keys`;
-            }
-            return limited;
+    if (factory.isModelBusy(modelName)) {
+        console.log(`🔄 模型 ${modelName} 忙碌，使用默认 tiny 实例`);
+        useDefaultModel = true;
+        const defaultFactory = DefaultWhisperManager;
+        // 检查默认模型是否忙碌
+        if (defaultFactory.isBusyStatus()) {
+            console.log(`🔄 默认模型也忙碌，等待默认模型空闲...`);
         }
-        return value;
-    }, 2));
-
-    // 调试：查看 output.text
-    console.log('🔍 调试：output.text:', typeof output.text, output.text);
-    console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
-
-    // 格式化结果
-    const result = {
-        text: traditionalToSimplified(output.text),
-        chunks: sanitizeTimestamps(output.chunks || []),
-        language: output.language || config.language,
-        duration: output.duration || 0,
-        task: config.subtask,
-        model: modelName,
-        timestamp: new Date().toISOString(),
-        confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
-    };
-
-    // 调试：查看 result.text
-    console.log('🔍 调试：result.text:', typeof result.text, result.text);
-    console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
-
-    // 如果检测到繁体字，转换为简体并记录
-    if (output.text !== result.text) {
-        console.log('🔄 检测到繁体字，已转换为简体中文');
+        transcriber = await defaultFactory.getInstance(config.progress_callback);
+        defaultFactory.setBusy(true);
+    } else {
+        // 使用请求的模型
+        console.log(`🎯 使用请求的模型 ${modelName}`);
+        factory.markModelBusy(modelName);
+        console.log(`🔍 调试：标记后忙碌模型列表: ${factory.getBusyModels().join(', ')}`);
+        transcriber = await factory.getInstance(config.progress_callback);
     }
 
-    return result;
+    try {
+        // 准备转录输入
+        let transcriptionInput = audioData;
+        if (audioData instanceof Float32Array || audioData instanceof Float64Array) {
+            console.log('🎯 音频数据已为 Float32Array 或 Float64Array，直接传递给 Whisper');
+        } else if (audioData instanceof Buffer) {
+            console.log('🎯 音频数据为 Buffer，转换为 ArrayBuffer 后直接传递');
+            transcriptionInput = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.byteLength);
+        } else if (audioData instanceof ArrayBuffer) {
+            console.log('🎯 音频数据为 ArrayBuffer，直接传递');
+        } else {
+            console.log('🎯 音频数据为其他类型，直接传递:', typeof audioData);
+        }
+
+        // 使用带有重试机制的转录函数
+        const output = await transcribeWithRetry(transcriber, transcriptionInput, transcribeConfig);
+
+        if (!output) {
+            throw new Error('所有转录尝试均失败，结果质量不满足要求');
+        }
+
+        // 调试：查看 output 对象结构
+        console.log('🔍 调试：output 对象:', JSON.stringify(output, (key, value) => {
+            if (typeof value === 'object' && value !== null) {
+                const limited = {};
+                for (const k of Object.keys(value).slice(0, 10)) {
+                    limited[k] = value[k];
+                }
+                if (Object.keys(value).length > 10) {
+                    limited['...'] = `${Object.keys(value).length - 10} more keys`;
+                }
+                return limited;
+            }
+            return value;
+        }, 2));
+
+        // 调试：查看 output.text
+        console.log('🔍 调试：output.text:', typeof output.text, output.text);
+        console.log('🔍 调试：output.text 长度:', output.text ? output.text.length : 0);
+
+        // 格式化结果
+        const result = {
+            text: traditionalToSimplified(output.text),
+            chunks: sanitizeTimestamps(output.chunks || []),
+            language: output.language || config.language,
+            duration: output.duration || 0,
+            task: config.subtask,
+            model: modelName,
+            timestamp: new Date().toISOString(),
+            confidence: calculateConfidence(sanitizeTimestamps(output.chunks || []))
+        };
+
+        // 调试：查看 result.text
+        console.log('🔍 调试：result.text:', typeof result.text, result.text);
+        console.log('🔍 调试：result.text 长度:', result.text ? result.text.length : 0);
+
+        // 如果检测到繁体字，转换为简体并记录
+        if (output.text !== result.text) {
+            console.log('🔄 检测到繁体字，已转换为简体中文');
+        }
+
+        // 更新结果信息
+        result.usedDefaultModel = useDefaultModel;
+        if (useDefaultModel) {
+            result.model = 'Xenova/whisper-tiny';  // 使用默认模型时更新模型名称
+            result.fallbackReason = `模型 ${modelName} 忙碌`;
+        }
+
+        return result;
+    } finally {
+        // 标记模型为空闲（如果使用的是工厂管理的模型）
+        if (!useDefaultModel) {
+            factory.markModelFree(modelName);
+        } else {
+            // 使用默认实例时，标记默认实例为空闲
+            DefaultWhisperManager.setBusy(false);
+        }
+    }
 }
 
 // 音频转文本核心功能
