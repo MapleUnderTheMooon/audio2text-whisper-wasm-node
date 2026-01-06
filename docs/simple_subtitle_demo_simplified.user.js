@@ -17,8 +17,8 @@
     // 配置
     const CONFIG = {
         API_ENDPOINT: 'http://localhost:3000/api/transcribe',
-        SAMPLE_RATE: 16000, // Whisper 使用的采样率
-        BUFFER_SIZE: 4096, // ScriptProcessor 缓冲区大小 (约250ms@16kHz)
+        SAMPLE_RATE: 44100, // 提高到44.1kHz，保持高频信息
+        BUFFER_SIZE: 4096, // ScriptProcessor 缓冲区大小 (约93ms@44.1kHz)
         ACCUMULATE_DURATION: 3, // 累积3秒音频后发送，平衡精度和延迟
         CACHE_DURATION: 60000, // 字幕缓存时长：60秒
         DELAY_MULTIPLIER: 1, // 延迟倍数，1表示完全抵消延迟，可调节
@@ -987,8 +987,8 @@
 
     // ========== 音频增强辅助 ==========
 
-    // 预加重滤波（增强高频，提升语音清晰度）
-    function preEmphasis(audioData, alpha = 0.97) {
+    // 预加重滤波（适度增强高频，避免过度处理）
+    function preEmphasis(audioData, alpha = 0.95) { // 降低alpha值，减少过度增强
         const emphasized = new Float32Array(audioData.length);
         emphasized[0] = audioData[0]; // 第一个样本保持不变
 
@@ -1021,8 +1021,8 @@
     // 音量标准化
     function normalizeAudio(audioData) {
         const currentRMS = calculateRMS(audioData);
-        // 目标 RMS 为 0.1（约 -20dB）
-        const targetRMS = 0.1;
+        // 目标 RMS 为 0.05（约 -26dB），更保守的处理
+        const targetRMS = 0.05;
 
         // 计算增益，限制在合理范围内
         let gain = targetRMS / currentRMS;
@@ -1052,8 +1052,8 @@
     // 简单的带通滤波器
     function bandPassFilter(audioData) {
         const sampleRate = CONFIG.SAMPLE_RATE;
-        const lowCut = 80;    // 低频截止
-        const highCut = 3800; // 高频截止
+        const lowCut = 60;    // 低频截止，扩展到60Hz
+        const highCut = 6000; // 高频截止，扩展到6000Hz
 
         // 归一化频率
         const low = 2 * Math.PI * lowCut / sampleRate;
@@ -1660,13 +1660,9 @@
             button.textContent = '开启字幕';
             button.style.background = '#1890ff';
         } else {
-            if (state.isVideoPlaying) {
-                button.textContent = '关闭字幕';
-                button.style.background = '#ff4d4f';
-            } else {
-                button.textContent = '视频暂停';
-                button.style.background = '#faad14'; // 黄色表示暂停状态
-            }
+            // 当字幕功能启用时，显示"关闭字幕"，不显示视频状态
+            button.textContent = '关闭字幕';
+            button.style.background = state.isVideoPlaying ? '#ff4d4f' : '#faad14';
         }
     }
 
@@ -1785,11 +1781,13 @@
 
         // 添加视频状态监听，实时更新按钮
         const checkVideoState = () => {
-            if (state.videoElement && state.isEnabled) {
+            if (state.videoElement) {
                 const isCurrentlyPlaying = !state.videoElement.paused && !state.videoElement.ended;
                 if (isCurrentlyPlaying !== state.isVideoPlaying) {
                     state.isVideoPlaying = isCurrentlyPlaying;
-                    updateButtonText();
+                    if (state.isEnabled) {
+                        updateButtonText();
+                    }
                 }
             }
         };
