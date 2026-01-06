@@ -691,6 +691,7 @@
         try {
             const formData = new FormData();
             formData.append('audio', audioBlob, 'audio.wav');
+            formData.append('model', 'Xenova/whisper-tiny');
             formData.append('language', 'zh');
             formData.append('subtask', 'transcribe');
 
